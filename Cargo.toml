@@ -6,7 +6,7 @@ rust-version = "1.70"
 authors = ["Corey Phillips"]
 description = "A Rust library for private messaging using Pubky"
 license = "MIT"
-repository = "https://github.com/yourusername/pubky-messenger"
+repository = "https://github.com/coreyphillips/pubky-messenger"
 keywords = ["pubky", "messaging", "encryption", "private", "chat"]
 categories = ["cryptography", "network-programming"]
 
