@@ -7,22 +7,20 @@ fn test_message_encryption_decryption() {
     let alice_keypair = Keypair::random();
     let bob_keypair = Keypair::random();
 
-    let alice_pubkey = alice_keypair.public_key();
-    let bob_pubkey = bob_keypair.public_key();
+    let alice_pubky = alice_keypair.public_key();
+    let bob_pubky = bob_keypair.public_key();
 
     // Create a message from Alice to Bob
     let content = "Hello Bob!";
-    let message = PrivateMessage::new(&alice_keypair, &bob_pubkey, content).unwrap();
+    let message = PrivateMessage::new(&alice_keypair, &bob_pubky, content).unwrap();
 
     // Bob decrypts the message
-    let decrypted_content = message
-        .decrypt_content(&bob_keypair, &alice_pubkey)
-        .unwrap();
-    let decrypted_sender = message.decrypt_sender(&bob_keypair, &alice_pubkey).unwrap();
+    let decrypted_content = message.decrypt_content(&bob_keypair, &alice_pubky).unwrap();
+    let decrypted_sender = message.decrypt_sender(&bob_keypair, &alice_pubky).unwrap();
 
     // Verify the content and sender
     assert_eq!(decrypted_content, content);
-    assert_eq!(decrypted_sender, alice_pubkey.to_string());
+    assert_eq!(decrypted_sender, alice_pubky.to_string());
 
     // Verify signature
     let verified = message

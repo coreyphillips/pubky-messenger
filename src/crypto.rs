@@ -32,28 +32,28 @@ pub fn ed25519_secret_to_x25519(ed_secret: &[u8; 32]) -> StaticSecret {
 }
 
 /// Generate shared secret for encryption between two keypairs
-pub fn generate_shared_secret(keypair: &Keypair, other_pubkey: &PublicKey) -> Result<String> {
+pub fn generate_shared_secret(keypair: &Keypair, other_pubky: &PublicKey) -> Result<String> {
     let ed25519_secret = keypair.secret_key();
     let x25519_secret = ed25519_secret_to_x25519(&ed25519_secret);
 
-    let other_pubkey_bytes = other_pubkey.as_bytes();
-    if other_pubkey_bytes.len() != 32 {
+    let other_pubky_bytes = other_pubky.as_bytes();
+    if other_pubky_bytes.len() != 32 {
         return Err(anyhow!("Invalid public key length"));
     }
 
     let mut other_ed_bytes = [0u8; 32];
-    other_ed_bytes.copy_from_slice(other_pubkey_bytes);
+    other_ed_bytes.copy_from_slice(other_pubky_bytes);
 
     let other_x25519 = ed25519_public_to_x25519(&other_ed_bytes)
-        .ok_or_else(|| anyhow!("Failed to convert pubkey to X25519"))?;
+        .ok_or_else(|| anyhow!("Failed to convert pubky to X25519"))?;
 
     let shared = x25519_secret.diffie_hellman(&other_x25519);
     Ok(hex::encode(shared.as_bytes()))
 }
 
 /// Generate deterministic conversation path for two parties
-pub fn generate_conversation_path(keypair: &Keypair, other_pubkey: &PublicKey) -> Result<String> {
-    let shared_secret = generate_shared_secret(keypair, other_pubkey)?;
+pub fn generate_conversation_path(keypair: &Keypair, other_pubky: &PublicKey) -> Result<String> {
+    let shared_secret = generate_shared_secret(keypair, other_pubky)?;
     let path_id = blake3::hash(shared_secret.as_bytes()).to_hex();
     Ok(format!("/pub/private_messages/{}/", path_id))
 }

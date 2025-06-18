@@ -79,13 +79,13 @@ impl PrivateMessengerClient {
     }
 
     /// Get all messages in a conversation
-    pub async fn get_messages(&self, other_pubkey: &PublicKey) -> Result<Vec<DecryptedMessage>> {
+    pub async fn get_messages(&self, other_pubky: &PublicKey) -> Result<Vec<DecryptedMessage>> {
         let mut all_messages = Vec::new();
-        let private_path = generate_conversation_path(&self.keypair, other_pubkey)?;
+        let private_path = generate_conversation_path(&self.keypair, other_pubky)?;
 
         // Check both user's paths
         let self_path = format!("pubky://{}{}", self.keypair.public_key(), private_path);
-        let other_path = format!("pubky://{}{}", other_pubkey, private_path);
+        let other_path = format!("pubky://{}{}", other_pubky, private_path);
 
         let mut urls = Vec::new();
 
@@ -109,8 +109,8 @@ impl PrivateMessengerClient {
                 let response_text = response.text().await?;
 
                 if let Ok(message) = serde_json::from_str::<PrivateMessage>(&response_text) {
-                    if let Ok(content) = message.decrypt_content(&self.keypair, other_pubkey) {
-                        if let Ok(sender) = message.decrypt_sender(&self.keypair, other_pubkey) {
+                    if let Ok(content) = message.decrypt_content(&self.keypair, other_pubky) {
+                        if let Ok(sender) = message.decrypt_sender(&self.keypair, other_pubky) {
                             let verified = message
                                 .verify_signature(&content, &sender)
                                 .unwrap_or(false);

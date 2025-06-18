@@ -91,7 +91,7 @@ The main client for interacting with the Pubky messaging system.
 
 - `new(keypair: Keypair) -> Result<Self>` - Create a new client from a keypair
 - `from_recovery_file(bytes: &[u8], passphrase: &str) -> Result<Self>` - Create from recovery file
-- `sign_in(&self) -> Result<Session>` - Sign in to Pubky
+- `sign_in(&self) -> Result<Session>` - Sign in to the homeserver
 - `send_message(&self, recipient: &PublicKey, content: &str) -> Result<String>` - Send encrypted message
 - `get_messages(&self, other: &PublicKey) -> Result<Vec<DecryptedMessage>>` - Get conversation messages
 - `get_own_profile(&self) -> Result<Option<PubkyProfile>>` - Get user's profile
@@ -129,28 +129,28 @@ Check the `examples/` directory for more detailed examples:
 
 ```bash
 # Run the basic usage example
-cargo run --example basic_usage -- path/to/recovery.pkarr [optional_recipient_pubkey]
+cargo run --example basic_usage -- path/to/recovery.pkarr [optional_recipient_pubky]
 ```
 
 This example demonstrates:
 - Loading a recovery file and signing in
 - Displaying your profile information
 - Listing followed users
-- Sending a test message (if recipient pubkey provided)
+- Sending a test message (if recipient pubky provided)
 - Reading conversation messages
 
 ### Send Message Example
 
 ```bash
 # Send a message to a specific pubky
-cargo run --example send_message -- path/to/recovery.pkarr recipient_pubkey "Your message here"
+cargo run --example send_message -- path/to/recovery.pkarr recipient_pubky "Your message here"
 
 # Example:
 cargo run --example send_message -- recovery.pkarr pk:q9x5sfjbpajdebk45b9jashgb86iem7rnwpmu16px3ens63xzwro "Hello there!"
 ```
 
 This example:
-- Takes a recovery file, recipient pubkey, and message as arguments
+- Takes a recovery file, recipient pubky, and message as arguments
 - Signs in to Pubky
 - Sends the message to the specified recipient
 - Displays the message ID and timestamp
@@ -159,14 +159,14 @@ This example:
 
 ```bash
 # Read all messages from a conversation with a specific pubky
-cargo run --example read_messages -- path/to/recovery.pkarr peer_pubkey
+cargo run --example read_messages -- path/to/recovery.pkarr peer_pubky
 
 # Example:
 cargo run --example read_messages -- recovery.pkarr pk:q9x5sfjbpajdebk45b9jashgb86iem7rnwpmu16px3ens63xzwro
 ```
 
 This example:
-- Takes a recovery file and peer pubkey as arguments
+- Takes a recovery file and peer pubky as arguments
 - Signs in to Pubky
 - Fetches all messages from the conversation
 - Displays messages in a formatted, chronological order
@@ -176,7 +176,7 @@ This example:
 
 ```bash
 # Start an interactive chat session with a specific pubky
-cargo run --example conversation -- path/to/recovery.pkarr peer_pubkey
+cargo run --example conversation -- path/to/recovery.pkarr peer_pubky
 
 # Example:
 cargo run --example conversation -- recovery.pkarr pk:q9x5sfjbpajdebk45b9jashgb86iem7rnwpmu16px3ens63xzwro

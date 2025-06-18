@@ -7,7 +7,7 @@ use std::io::{self, Write};
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <recovery_file_path> <peer_pubkey>", args[0]);
+        eprintln!("Usage: {} <recovery_file_path> <peer_pubky>", args[0]);
         eprintln!(
             "Example: {} recovery.pkarr pk:q9x5sfjbpajdebk45b9jashgb86iem7rnwpmu16px3ens63xzwro",
             args[0]
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     }
 
     let recovery_file_path = &args[1];
-    let peer_pubkey_str = &args[2];
+    let peer_pubky_str = &args[2];
 
     print!("Enter passphrase: ");
     io::stdout().flush()?;
@@ -34,9 +34,9 @@ async fn main() -> Result<()> {
     client.sign_in().await?;
     println!("Signed in successfully!");
 
-    let peer = PublicKey::try_from(peer_pubkey_str.as_str())?;
+    let peer = PublicKey::try_from(peer_pubky_str.as_str())?;
 
-    println!("\nFetching conversation with {}...", peer_pubkey_str);
+    println!("\nFetching conversation with {}...", peer_pubky_str);
     let messages = client.get_messages(&peer).await?;
 
     if messages.is_empty() {

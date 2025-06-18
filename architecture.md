@@ -60,12 +60,12 @@ Each encrypted message contains:
 - `timestamp`: Unix timestamp with nanosecond precision
 - `encrypted_sender`: Sender's public key encrypted with shared secret
 - `encrypted_content`: Message content encrypted with shared secret
-- `signature`: Ed25519 signature over (content + sender_pubkey + timestamp)
+- `signature`: Ed25519 signature over (content + sender_pubky + timestamp)
 
 ### 4. Encryption Flow
 
 1. Generate shared secret using ECDH
-2. Create message digest: `Blake3(content || sender_pubkey || timestamp)`
+2. Create message digest: `Blake3(content || sender_pubky || timestamp)`
 3. Sign the digest with sender's Ed25519 private key
 4. Encrypt content using ChaCha20-Poly1305 with shared secret
 5. Encrypt sender identity using ChaCha20-Poly1305 with shared secret
@@ -143,10 +143,10 @@ Clients check both potential message locations:
 let client = PrivateMessengerClient::new(keypair);
 
 // Send message
-let encrypted_msg = client.send_message(recipient_pubkey, "Hello, world!").await?;
+let encrypted_msg = client.send_message(recipient_pubky, "Hello, world!").await?;
 
 // Receive messages
-let messages = client.get_messages(sender_pubkey).await?;
+let messages = client.get_messages(sender_pubky).await?;
 for msg in messages {
     println!("From: {}", msg.sender);
     println!("Content: {}", msg.content);

@@ -8,7 +8,7 @@ async fn main() -> Result<()> {
     // Get command line arguments
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <recovery_file_path> [recipient_pubkey]", args[0]);
+        eprintln!("Usage: {} <recovery_file_path> [recipient_pubky]", args[0]);
         std::process::exit(1);
     }
 
@@ -54,10 +54,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    // If recipient pubkey provided, send a message and fetch conversation
+    // If recipient pubky provided, send a message and fetch conversation
     if args.len() > 2 {
-        let recipient_pubkey_str = &args[2];
-        let recipient = PublicKey::try_from(recipient_pubkey_str.as_str())?;
+        let recipient_pubky_str = &args[2];
+        let recipient = PublicKey::try_from(recipient_pubky_str.as_str())?;
 
         // Send a test message
         println!("\nSending test message...");

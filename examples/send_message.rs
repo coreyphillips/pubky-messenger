@@ -8,7 +8,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "Usage: {} <recovery_file_path> <recipient_pubkey> <message>",
+            "Usage: {} <recovery_file_path> <recipient_pubky> <message>",
             args[0]
         );
         eprintln!("Example: {} recovery.pkarr pk:q9x5sfjbpajdebk45b9jashgb86iem7rnwpmu16px3ens63xzwro \"Hello there!\"", args[0]);
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     }
 
     let recovery_file_path = &args[1];
-    let recipient_pubkey_str = &args[2];
+    let recipient_pubky_str = &args[2];
     let message_content = &args[3];
 
     print!("Enter passphrase: ");
@@ -35,8 +35,8 @@ async fn main() -> Result<()> {
     client.sign_in().await?;
     println!("Signed in successfully!");
 
-    let recipient = PublicKey::try_from(recipient_pubkey_str.as_str())?;
-    println!("\nSending message to {}...", recipient_pubkey_str);
+    let recipient = PublicKey::try_from(recipient_pubky_str.as_str())?;
+    println!("\nSending message to {}...", recipient_pubky_str);
 
     let message_id = client.send_message(&recipient, message_content).await?;
     println!("✓ Message sent successfully!");
