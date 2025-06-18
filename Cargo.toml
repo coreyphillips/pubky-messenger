@@ -1,0 +1,47 @@
+[package]
+name = "pubky-messenger"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["Corey Phillips"]
+description = "A Rust library for private messaging using Pubky"
+license = "MIT"
+repository = "https://github.com/yourusername/pubky-messenger"
+keywords = ["pubky", "messaging", "encryption", "private", "chat"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+# Core
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+# Pubky
+pubky = "0.4"
+pubky-common = "0.3"
+pkarr = "3.7"
+
+# Cryptography
+blake3 = "1.5"
+hex = "0.4"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = "4"
+ed25519-dalek = "2"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+
+[dev-dependencies]
+chrono = "0.4"
+rpassword = "7"
+
+[[example]]
+name = "get_info"
+path = "examples/get_info.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
