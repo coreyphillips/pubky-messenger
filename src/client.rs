@@ -229,4 +229,144 @@ impl PrivateMessengerClient {
     pub fn public_key_string(&self) -> String {
         self.keypair.public_key().to_string()
     }
+
+    /// Delete a single message by its ID from a conversation
+    pub async fn delete_message(&self, message_id: &str, other_pubky: &PublicKey) -> Result<()> {
+        let private_path = generate_conversation_path(&self.keypair, other_pubky)?;
+        let url = format!(
+            "pubky://{}{}{}",
+            self.keypair.public_key(),
+            private_path,
+            format!("{}.json", message_id)
+        );
+
+        let response = self.client.delete(&url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to delete message: {}", response.status()));
+        }
+
+        Ok(())
+    }
+
+    /// Delete multiple messages by their IDs from a conversation
+    pub async fn delete_messages(
+        &self,
+        message_ids: Vec<String>,
+        other_pubky: &PublicKey,
+    ) -> Result<()> {
+        let private_path = generate_conversation_path(&self.keypair, other_pubky)?;
+
+        // Create delete futures for all messages
+        let delete_futures: Vec<_> = message_ids
+            .iter()
+            .map(|msg_id| {
+                let url = format!(
+                    "pubky://{}{}{}",
+                    self.keypair.public_key(),
+                    private_path,
+                    format!("{}.json", msg_id)
+                );
+                async move { self.client.delete(&url).send().await }
+            })
+            .collect();
+
+        // Execute all deletions in parallel
+        let results = join_all(delete_futures).await;
+
+        // Check for any failures
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(response) if !response.status().is_success() => {
+                    return Err(anyhow!(
+                        "Failed to delete message {}: {}",
+                        message_ids[i],
+                        response.status()
+                    ));
+                }
+                Err(e) => {
+                    return Err(anyhow!("Failed to delete message {}: {}", message_ids[i], e));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear all sent messages in a conversation with a specific pubky
+    pub async fn clear_messages(&self, other_pubky: &PublicKey) -> Result<()> {
+        let private_path = generate_conversation_path(&self.keypair, other_pubky)?;
+        let self_path = format!("pubky://{}{}", self.keypair.public_key(), private_path);
+
+        // List all messages in the conversation
+        let urls = match self.client.list(&self_path) {
+            Ok(list_builder) => match list_builder.send().await {
+                Ok(urls) => urls,
+                Err(_) => {
+                    // No messages to clear
+                    return Ok(());
+                }
+            },
+            Err(_) => {
+                // No messages to clear
+                return Ok(());
+            }
+        };
+
+        // If no messages, return early
+        if urls.is_empty() {
+            return Ok(());
+        }
+
+        // Delete messages in smaller batches to avoid rate limiting
+        const BATCH_SIZE: usize = 5;
+        for chunk in urls.chunks(BATCH_SIZE) {
+            // Create delete futures for this batch
+            let delete_futures: Vec<_> = chunk
+                .iter()
+                .map(|url| async move { self.client.delete(url).send().await })
+                .collect();
+
+            // Execute batch deletions in parallel
+            let results = join_all(delete_futures).await;
+
+            // Check for any failures
+            for (i, result) in results.iter().enumerate() {
+                match result {
+                    Ok(response) if !response.status().is_success() => {
+                        // Retry once on rate limiting
+                        if response.status() == 429 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                            let retry = self.client.delete(&chunk[i]).send().await?;
+                            if !retry.status().is_success() {
+                                return Err(anyhow!(
+                                    "Failed to delete message at {} after retry: {}",
+                                    chunk[i],
+                                    retry.status()
+                                ));
+                            }
+                        } else {
+                            return Err(anyhow!(
+                                "Failed to delete message at {}: {}",
+                                chunk[i],
+                                response.status()
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("Failed to delete message at {}: {}", chunk[i], e));
+                    }
+                    _ => {}
+                }
+            }
+
+            // Add a small delay between batches to avoid rate limiting
+            if chunk.len() == BATCH_SIZE {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+        }
+
+        Ok(())
+    }
 }

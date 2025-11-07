@@ -1,6 +1,6 @@
 [package]
 name = "pubky-messenger"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
 authors = ["Corey Phillips"]
@@ -37,6 +37,7 @@ futures = "0.3"
 [dev-dependencies]
 chrono = "0.4"
 rpassword = "7"
+tokio = { version = "1.44.0", features = ["full", "test-util"] }
 
 [[example]]
 name = "get_info"

@@ -81,6 +81,29 @@ for user in followed {
 }
 ```
 
+### Managing Messages
+
+The library provides methods to delete messages from your conversations:
+
+```rust
+// Delete a single message
+let message_id = "550e8400-e29b-41d4-a716-446655440000";
+client.delete_message(message_id, &recipient).await?;
+
+// Delete multiple messages at once
+let message_ids = vec![
+    "id1".to_string(),
+    "id2".to_string(),
+    "id3".to_string(),
+];
+client.delete_messages(message_ids, &recipient).await?;
+
+// Clear all your sent messages in a conversation
+client.clear_messages(&recipient).await?;
+```
+
+**Note:** These delete operations only remove messages from your own storage on the Pubky network. Messages stored by the recipient remain unchanged.
+
 ## API Reference
 
 ### `PrivateMessengerClient`
@@ -94,6 +117,9 @@ The main client for interacting with the Pubky messaging system.
 - `sign_in(&self) -> Result<Session>` - Sign in to the homeserver
 - `send_message(&self, recipient: &PublicKey, content: &str) -> Result<String>` - Send encrypted message
 - `get_messages(&self, other: &PublicKey) -> Result<Vec<DecryptedMessage>>` - Get conversation messages
+- `delete_message(&self, message_id: &str, other: &PublicKey) -> Result<()>` - Delete a single message
+- `delete_messages(&self, message_ids: Vec<String>, other: &PublicKey) -> Result<()>` - Delete multiple messages
+- `clear_messages(&self, other: &PublicKey) -> Result<()>` - Clear all sent messages in a conversation
 - `get_own_profile(&self) -> Result<Option<PubkyProfile>>` - Get user's profile
 - `get_followed_users(&self) -> Result<Vec<FollowedUser>>` - Get followed users
 - `public_key(&self) -> PublicKey` - Get the client's public key
@@ -195,6 +221,37 @@ This example provides a real-time chat experience:
 - Message history display
 - Automatic new message detection
 - Clean, chat-like interface
+
+## Testing
+
+### Running Tests
+
+The library includes comprehensive unit and integration tests. Due to API rate limiting, it's recommended to run tests sequentially:
+
+```bash
+# Run all tests sequentially (recommended)
+cargo test -- --test-threads=1
+
+# Run specific test file
+cargo test --test test_delete_methods -- --test-threads=1
+
+# Run with output for debugging
+cargo test -- --test-threads=1 --nocapture
+```
+
+### Test Files with Recovery Keys
+
+The repository includes test recovery files (`p1.pkarr` and `p2.pkarr`) in the root directory for integration testing. Both use `"password"` as the passphrase.
+
+**Important:** These test files are for development only and should never be used in production.
+
+### Writing Tests
+
+When writing tests that interact with the Pubky network:
+1. Use unique message content with timestamps to avoid conflicts
+2. Add delays between operations when necessary (`tokio::time::sleep`)
+3. Handle existing messages in conversations gracefully
+4. Run tests sequentially to avoid rate limiting
 
 ## Security
 
