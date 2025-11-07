@@ -16,7 +16,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pubky-messenger = "0.2.0"
+pubky-messenger = "0.2.1"
 ```
 
 ## Usage
