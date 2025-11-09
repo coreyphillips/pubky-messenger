@@ -31,24 +31,27 @@ use anyhow::Result;
 async fn main() -> Result<()> {
     // Load recovery file
     let recovery_file = std::fs::read("recovery.pkarr")?;
-    
-    // Create client
-    let client = PrivateMessengerClient::from_recovery_file(&recovery_file, "your_passphrase")?;
-    
+
+    // Create client with passphrase
+    let client = PrivateMessengerClient::from_recovery_file(&recovery_file, Some("your_passphrase"))?;
+
+    // Or without passphrase (defaults to empty string)
+    // let client = PrivateMessengerClient::from_recovery_file(&recovery_file, None)?;
+
     // Sign in
     client.sign_in().await?;
-    
+
     // Send a message
     let recipient = PublicKey::try_from("recipient_public_key_here")?;
     let message_id = client.send_message(&recipient, "Hello, world!").await?;
     println!("Message sent with ID: {}", message_id);
-    
+
     // Get messages
     let messages = client.get_messages(&recipient).await?;
     for msg in messages {
         println!("{}: {}", msg.sender, msg.content);
     }
-    
+
     Ok(())
 }
 ```
@@ -64,6 +67,67 @@ use pubky_messenger::PrivateMessengerClient;
 let keypair = Keypair::random();
 let client = PrivateMessengerClient::new(keypair)?;
 ```
+
+### Creating a Client from Recovery Phrase
+
+You can also create a client using a 12-word mnemonic recovery phrase with optional passphrase and language:
+
+```rust
+use pubky_messenger::PrivateMessengerClient;
+
+// Basic usage - defaults to English, no passphrase
+let mnemonic = "your twelve word recovery phrase goes here with spaces between words";
+let client = PrivateMessengerClient::from_recovery_phrase(mnemonic, None, None)?;
+
+// Sign in and use as normal
+client.sign_in().await?;
+```
+
+**With optional passphrase for additional security:**
+
+```rust
+// Add a passphrase for extra security
+let client_with_passphrase = PrivateMessengerClient::from_recovery_phrase(
+    mnemonic,
+    Some("my_secure_passphrase"),  // Optional passphrase
+    None,                           // Use default English
+)?;
+```
+
+**With different language:**
+
+```rust
+use pubky_messenger::{Language, PrivateMessengerClient};
+
+// Use a different language
+let client = PrivateMessengerClient::from_recovery_phrase(
+    mnemonic,
+    None,                           // No passphrase
+    Some(Language::English),        // Explicit language
+)?;
+```
+
+**With both passphrase and language:**
+
+```rust
+let client = PrivateMessengerClient::from_recovery_phrase(
+    mnemonic,
+    Some("my_passphrase"),          // Optional passphrase
+    Some(Language::English),        // Optional language
+)?;
+```
+
+The recovery phrase must be:
+- Exactly 12 words from the BIP39 wordlist for the specified language
+- In the correct format for that language (e.g., lowercase for English)
+- Separated by single spaces
+
+**Parameters:**
+- `mnemonic_phrase`: The 12-word BIP39 mnemonic (required)
+- `passphrase`: Optional passphrase for additional security (defaults to empty string)
+- `language`: Optional language for mnemonic validation (defaults to English)
+
+This method provides a deterministic way to recover your keypair from a mnemonic phrase. The same mnemonic with the same passphrase and language will always produce the same keypair.
 
 ### Working with Profiles
 
@@ -113,7 +177,8 @@ The main client for interacting with the Pubky messaging system.
 #### Methods
 
 - `new(keypair: Keypair) -> Result<Self>` - Create a new client from a keypair
-- `from_recovery_file(bytes: &[u8], passphrase: &str) -> Result<Self>` - Create from recovery file
+- `from_recovery_file(bytes: &[u8], passphrase: Option<&str>) -> Result<Self>` - Create from recovery file with optional passphrase
+- `from_recovery_phrase(mnemonic: &str, passphrase: Option<&str>, language: Option<Language>) -> Result<Self>` - Create from 12-word BIP39 mnemonic with optional passphrase and language
 - `sign_in(&self) -> Result<Session>` - Sign in to the homeserver
 - `send_message(&self, recipient: &PublicKey, content: &str) -> Result<String>` - Send encrypted message
 - `get_messages(&self, other: &PublicKey) -> Result<Vec<DecryptedMessage>>` - Get conversation messages

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use bip39::{Language, Mnemonic};
 use futures::future::join_all;
 use pkarr::{Keypair, PublicKey};
 use pubky_common::recovery_file;
@@ -40,9 +41,54 @@ impl PrivateMessengerClient {
     }
 
     /// Create a new client from a recovery file
-    pub fn from_recovery_file(recovery_file_bytes: &[u8], passphrase: &str) -> Result<Self> {
-        let keypair = recovery_file::decrypt_recovery_file(recovery_file_bytes, passphrase)
+    ///
+    /// # Parameters
+    /// - `recovery_file_bytes`: The bytes of the .pkarr recovery file
+    /// - `passphrase`: Optional passphrase to decrypt the file (defaults to empty string)
+    pub fn from_recovery_file(
+        recovery_file_bytes: &[u8],
+        passphrase: Option<&str>,
+    ) -> Result<Self> {
+        // Use provided passphrase or default to empty string
+        let pass = passphrase.unwrap_or("");
+
+        let keypair = recovery_file::decrypt_recovery_file(recovery_file_bytes, pass)
             .map_err(|e| anyhow!("Failed to decrypt recovery file: {:?}", e))?;
+
+        Self::new(keypair)
+    }
+
+    /// Create a new client from a 12-word mnemonic recovery phrase
+    ///
+    /// # Parameters
+    /// - `mnemonic_phrase`: The 12-word BIP39 mnemonic phrase
+    /// - `passphrase`: Optional passphrase for additional security (defaults to empty string)
+    /// - `language`: Optional language for the mnemonic (defaults to English)
+    pub fn from_recovery_phrase(
+        mnemonic_phrase: &str,
+        passphrase: Option<&str>,
+        language: Option<Language>,
+    ) -> Result<Self> {
+        // Use provided language or default to English
+        let lang = language.unwrap_or(Language::English);
+
+        // Use provided passphrase or default to empty string
+        let pass = passphrase.unwrap_or("");
+
+        // Parse and validate the mnemonic
+        let mnemonic = Mnemonic::parse_in(lang, mnemonic_phrase)
+            .map_err(|e| anyhow!("Invalid mnemonic phrase: {}", e))?;
+
+        // Convert to seed with passphrase
+        let seed = mnemonic.to_seed(pass);
+
+        // Take first 32 bytes as the ed25519 secret key
+        let secret_key_bytes: [u8; 32] = seed[..32]
+            .try_into()
+            .map_err(|_| anyhow!("Failed to extract secret key from seed"))?;
+
+        // Create keypair from secret key
+        let keypair = Keypair::from_secret_key(&secret_key_bytes);
 
         Self::new(keypair)
     }
@@ -218,6 +264,98 @@ impl PrivateMessengerClient {
                 pubky: pubky_id.to_string(),
             })
         }
+    }
+
+    /// Get followed users for a specific pubky
+    pub async fn get_followed_users_for(&self, pubky: &str) -> Result<Vec<FollowedUser>> {
+        let follows_url = format!("pubky://{}/pub/pubky.app/follows/", pubky);
+        let response = self.client.get(&follows_url).send().await?;
+
+        if !response.status().is_success() {
+            return Ok(Vec::new());
+        }
+
+        let follows_response = response.text().await?;
+        let follow_urls: Vec<String> = follows_response
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|url| url.to_string())
+            .collect();
+
+        // Fetch profiles in parallel
+        let profile_futures: Vec<_> = follow_urls
+            .iter()
+            .map(|follow_url| {
+                let url = follow_url.clone();
+                async move { self.get_user_profile(&url).await }
+            })
+            .collect();
+
+        let results = join_all(profile_futures).await;
+
+        let mut users = Vec::new();
+        for result in results {
+            if let Ok(user) = result {
+                users.push(user);
+            }
+        }
+
+        Ok(users)
+    }
+
+    /// Follow a user by adding them to our follow list
+    pub async fn put_follow(&self, target_pubky: &str) -> Result<()> {
+        // Get current timestamp
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+
+        // Create follow data with timestamp
+        let follow_data = serde_json::json!({
+            "created_at": timestamp
+        });
+
+        // Construct the follow URL
+        let follow_url = format!(
+            "pubky://{}/pub/pubky.app/follows/{}",
+            self.keypair.public_key(),
+            target_pubky
+        );
+
+        // Send PUT request with follow data
+        let response = self.client
+            .put(&follow_url)
+            .body(follow_data.to_string())
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to create follow: {}", response.status()));
+        }
+
+        Ok(())
+    }
+
+    /// Unfollow a user by removing them from our follow list
+    pub async fn delete_follow(&self, target_pubky: &str) -> Result<()> {
+        // Construct the follow URL
+        let follow_url = format!(
+            "pubky://{}/pub/pubky.app/follows/{}",
+            self.keypair.public_key(),
+            target_pubky
+        );
+
+        // Send DELETE request
+        let response = self.client
+            .delete(&follow_url)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to delete follow: {}", response.status()));
+        }
+
+        Ok(())
     }
 
     /// Get the public key of this client

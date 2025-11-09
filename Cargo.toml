@@ -1,6 +1,6 @@
 [package]
 name = "pubky-messenger"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.70"
 authors = ["Corey Phillips"]
@@ -29,6 +29,7 @@ sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 curve25519-dalek = "4"
 ed25519-dalek = "2"
+bip39 = "2.0"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }

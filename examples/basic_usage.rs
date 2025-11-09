@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
 
     // Create client
     println!("Creating client and decrypting keypair...");
-    let client = PrivateMessengerClient::from_recovery_file(&recovery_file_bytes, &passphrase)?;
+    let client = PrivateMessengerClient::from_recovery_file(&recovery_file_bytes, Some(&passphrase))?;
 
     println!("Your public key: {}", client.public_key_string());
 

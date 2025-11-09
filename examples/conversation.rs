@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     println!("Creating client...");
     let client = Arc::new(PrivateMessengerClient::from_recovery_file(
         &recovery_file_bytes,
-        &passphrase,
+        Some(&passphrase),
     )?);
 
     println!("Your public key: {}", client.public_key_string());

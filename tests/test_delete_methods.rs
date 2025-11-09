@@ -5,7 +5,7 @@ use std::fs;
 // Helper function to load client from pkarr file
 async fn load_client(pkarr_file: &str, password: &str) -> Result<PrivateMessengerClient> {
     let recovery_file_bytes = fs::read(pkarr_file)?;
-    let client = PrivateMessengerClient::from_recovery_file(&recovery_file_bytes, password)?;
+    let client = PrivateMessengerClient::from_recovery_file(&recovery_file_bytes, Some(password))?;
     client.sign_in().await?;
     Ok(client)
 }

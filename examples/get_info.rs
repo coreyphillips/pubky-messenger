@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
     let recovery_file_bytes = std::fs::read(recovery_file_path)?;
 
     println!("Creating client...");
-    let client = PrivateMessengerClient::from_recovery_file(&recovery_file_bytes, &passphrase)?;
+    let client = PrivateMessengerClient::from_recovery_file(&recovery_file_bytes, Some(&passphrase))?;
 
     println!("Signing in to Pubky...");
     let session = client.sign_in().await?;

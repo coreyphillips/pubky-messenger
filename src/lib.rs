@@ -20,7 +20,7 @@
 //! let recovery_file = std::fs::read("recovery.pkarr")?;
 //!
 //! // Create client
-//! let client = PrivateMessengerClient::from_recovery_file(&recovery_file, "passphrase")?;
+//! let client = PrivateMessengerClient::from_recovery_file(&recovery_file, Some("passphrase"))?;
 //!
 //! // Sign in
 //! client.sign_in().await?;
@@ -43,3 +43,4 @@ pub use client::{FollowedUser, PrivateMessengerClient, PubkyProfile};
 pub use message::{DecryptedMessage, PrivateMessage};
 
 pub use pkarr::{Keypair, PublicKey};
+pub use bip39::Language;
