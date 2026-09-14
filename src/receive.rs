@@ -41,6 +41,9 @@ pub struct FetchConfig {
     /// A listing is read until the homeserver returns an empty page, because a homeserver
     /// may return fewer entries than requested before the end.
     pub list_page_size: u16,
+    /// Entries one directory listing may hold before it fails, so a homeserver that keeps
+    /// returning new pages cannot keep a read going forever
+    pub max_listing_entries: usize,
 }
 
 impl Default for FetchConfig {
@@ -54,6 +57,7 @@ impl Default for FetchConfig {
             max_retry_delay: Duration::from_secs(10),
             // Pubky homeservers cap pages at 1000 entries
             list_page_size: 1000,
+            max_listing_entries: 100_000,
         }
     }
 }
@@ -89,6 +93,8 @@ pub enum FailureReason {
     Transport(String),
     /// A listing page did not advance past the previous page, so paging would never end
     ListingStalled,
+    /// A listing held more than `max_listing_entries` entries
+    ListingTooLong,
 }
 
 impl fmt::Display for FetchFailure {
@@ -98,6 +104,7 @@ impl fmt::Display for FetchFailure {
             FailureReason::TimedOut => "timed out".to_string(),
             FailureReason::Transport(error) => error.clone(),
             FailureReason::ListingStalled => "listing did not advance".to_string(),
+            FailureReason::ListingTooLong => "listing exceeded max_listing_entries".to_string(),
         };
         write!(
             f,
@@ -327,6 +334,13 @@ impl<'a, T: Transport> Requests<'a, T> {
                 }
                 _ => entries.extend(page),
             }
+            if entries.len() > self.config.max_listing_entries {
+                return Err(FetchFailure {
+                    url: page_url,
+                    attempts: 1,
+                    reason: FailureReason::ListingTooLong,
+                });
+            }
         }
 
         Ok(Some(entries))
@@ -439,6 +453,7 @@ mod tests {
             retry_base_delay: Duration::from_secs(1),
             max_retry_delay: Duration::from_secs(10),
             list_page_size: 1000,
+            max_listing_entries: 100_000,
         }
     }
 
@@ -881,6 +896,36 @@ mod tests {
         assert!(fetch.messages.is_empty());
         assert_eq!(fetch.failures.len(), 1);
         assert_eq!(fetch.failures[0].reason, FailureReason::ListingStalled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_longer_than_the_entry_limit_fails() {
+        let alice = keypair(1);
+        let bob = keypair(2);
+        let server = FakeServer::default();
+        server.publish(
+            &alice,
+            &bob.public_key(),
+            &as_refs(&history("from alice", 5)),
+        );
+        let config = FetchConfig {
+            list_page_size: 2,
+            max_listing_entries: 3,
+            ..config(4, 4)
+        };
+
+        let fetch = receive(
+            &server,
+            &request_permits(4),
+            &config,
+            &alice,
+            &bob.public_key(),
+        )
+        .await;
+
+        assert!(fetch.messages.is_empty());
+        assert_eq!(fetch.failures.len(), 1);
+        assert_eq!(fetch.failures[0].reason, FailureReason::ListingTooLong);
     }
 
     #[tokio::test(start_paused = true)]

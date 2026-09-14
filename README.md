@@ -206,8 +206,11 @@ conversation costs listing requests and nothing else.
 ```rust
 use pubky_messenger::ReceiveState;
 
-// Restore a saved state, or start from ReceiveState::default()
-let mut state: ReceiveState = serde_json::from_slice(&std::fs::read("state.json")?)?;
+// Restore a saved state, or start from ReceiveState::default() on the first run
+let mut state: ReceiveState = match std::fs::read("state.json") {
+    Ok(saved) => serde_json::from_slice(&saved)?,
+    Err(_) => ReceiveState::default(),
+};
 
 let received = client.receive_new_messages(&recipient, &mut state).await?;
 for item in &received.messages {
@@ -223,8 +226,9 @@ std::fs::write("state.json", serde_json::to_vec(&state)?)?;
 - Delivery is at least once. A message is returned again until it is acknowledged, so
   failed downloads and crashes before saving the state are retried. `MessageId` (publisher
   and URL) identifies a message across calls.
-- Discovery and retrieval can run separately: `discover_messages` returns `MessageId`s without
-  downloading anything, and `retrieve_messages` downloads the ones you pass it.
+- Discovery and retrieval can run separately: `discover_messages` lists `PendingMessage`s, each
+  with its `MessageId`, in `Discovery::pending` without downloading anything.
+  `retrieve_messages` downloads the `PendingMessage`s you pass it.
 - Listings are read in full on every call. Message names are random UUIDs, so a new message
   can sort anywhere in a listing and there is no position to resume from.
 - The state keeps one entry per acknowledged message that is still listed. Entries for
