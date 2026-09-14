@@ -129,6 +129,29 @@ The recovery phrase must be:
 
 This method provides a deterministic way to recover your keypair from a mnemonic phrase. The same mnemonic with the same passphrase and language will always produce the same keypair.
 
+### Creating an Account
+
+A new identity has no homeserver account, so `sign_in` fails until it signs up. `ensure_session` signs in, and signs up on the given homeserver only when the identity has no homeserver record yet:
+
+```rust
+use pubky_messenger::{PrivateMessengerClient, PublicKey};
+
+let homeserver = PublicKey::try_from("homeserver_public_key")?;
+let client = PrivateMessengerClient::from_recovery_phrase(mnemonic, None, None)?;
+
+// Optional signup token, if the homeserver requires one
+client.ensure_session(&homeserver, None).await?;
+```
+
+To use a testnet, custom pkarr relays, or other client settings, build the pubky client yourself:
+
+```rust
+use pubky_messenger::{pubky, Keypair, PrivateMessengerClient};
+
+let pubky_client = pubky::Client::builder().testnet().build()?;
+let client = PrivateMessengerClient::with_client(Keypair::random(), pubky_client);
+```
+
 ### Working with Profiles
 
 ```rust
@@ -177,9 +200,12 @@ The main client for interacting with the Pubky messaging system.
 #### Methods
 
 - `new(keypair: Keypair) -> Result<Self>` - Create a new client from a keypair
+- `with_client(keypair: Keypair, client: pubky::Client) -> Self` - Create a client using an already configured pubky client
 - `from_recovery_file(bytes: &[u8], passphrase: Option<&str>) -> Result<Self>` - Create from recovery file with optional passphrase
 - `from_recovery_phrase(mnemonic: &str, passphrase: Option<&str>, language: Option<Language>) -> Result<Self>` - Create from 12-word BIP39 mnemonic with optional passphrase and language
 - `sign_in(&self) -> Result<Session>` - Sign in to the homeserver
+- `sign_up(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<Session>` - Create an account on a homeserver
+- `ensure_session(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<Session>` - Sign in, signing up first if the identity has no homeserver yet
 - `send_message(&self, recipient: &PublicKey, content: &str) -> Result<String>` - Send encrypted message
 - `get_messages(&self, other: &PublicKey) -> Result<Vec<DecryptedMessage>>` - Get conversation messages
 - `delete_message(&self, message_id: &str, other: &PublicKey) -> Result<()>` - Delete a single message
@@ -189,6 +215,7 @@ The main client for interacting with the Pubky messaging system.
 - `get_followed_users(&self) -> Result<Vec<FollowedUser>>` - Get followed users
 - `public_key(&self) -> PublicKey` - Get the client's public key
 - `public_key_string(&self) -> String` - Get public key as string
+- `keypair(&self) -> &Keypair` - Get the client's keypair, including the secret key
 
 ### Types
 
