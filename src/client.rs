@@ -121,7 +121,14 @@ impl PrivateMessengerClient {
         self.client
             .signup(&self.keypair, homeserver, signup_token)
             .await
-            .map_err(|e| anyhow!("Failed to sign up: {}", e))
+            .map_err(|e| {
+                // pubky sends the token in the query string, and reqwest errors include the URL
+                let mut message = e.to_string();
+                if let Some(token) = signup_token.filter(|t| !t.is_empty()) {
+                    message = message.replace(token, "[redacted]");
+                }
+                anyhow!("Failed to sign up: {}", message)
+            })
     }
 
     /// Sign in, creating an account on `homeserver` if this identity has none yet

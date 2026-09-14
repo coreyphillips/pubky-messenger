@@ -116,6 +116,12 @@ async fn test_ensure_session_passes_signup_token() -> Result<()> {
         .await
         .is_err());
 
+    let error = client
+        .sign_up(&homeserver.public_key(), Some("AAAA-BBBB-CCCC"))
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().contains("AAAA-BBBB-CCCC"), "{error}");
+
     let admin = testnet.client_builder().build()?;
     let token = admin
         .get(format!(
