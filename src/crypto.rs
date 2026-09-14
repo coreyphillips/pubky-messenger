@@ -123,6 +123,33 @@ mod tests {
         }
     }
 
+    /// Moving the path orphans every stored conversation, and architecture.md documents it
+    #[test]
+    fn conversation_path_matches_0_3_0_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/conversation_v0_3_0.json"))
+                .unwrap();
+        let keypair = |name: &str| {
+            let bytes: [u8; 32] = hex::decode(fixture[name].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            Keypair::from_secret_key(&bytes)
+        };
+        let alice = keypair("alice_secret_key");
+        let bob = keypair("bob_secret_key");
+        let expected = fixture["conversation_path"].as_str().unwrap();
+
+        assert_eq!(
+            generate_conversation_path(&alice, &bob.public_key()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            generate_conversation_path(&bob, &alice.public_key()).unwrap(),
+            expected
+        );
+    }
+
     #[test]
     fn message_to_small_order_key_is_not_created() {
         let sender = Keypair::random();
