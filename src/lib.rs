@@ -44,3 +44,7 @@ pub use message::{DecryptedMessage, PrivateMessage};
 
 pub use pkarr::{Keypair, PublicKey};
 pub use bip39::Language;
+
+/// The pubky crate this library is built against, for configuring a client to pass to
+/// [`PrivateMessengerClient::with_client`] without a version mismatch.
+pub use pubky;

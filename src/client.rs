@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use bip39::{Language, Mnemonic};
 use futures::future::join_all;
 use pkarr::{Keypair, PublicKey};
-use pubky_common::recovery_file;
+use pubky_common::{recovery_file, session::Session};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::generate_conversation_path;
@@ -31,13 +31,20 @@ pub struct PrivateMessengerClient {
 }
 
 impl PrivateMessengerClient {
-    /// Create a new client from a keypair
+    /// Create a new client from a keypair, using a default mainnet pubky client
     pub fn new(keypair: Keypair) -> Result<Self> {
         let client = pubky::Client::builder()
             .build()
             .map_err(|e| anyhow!("Failed to create pubky client: {}", e))?;
 
-        Ok(Self { client, keypair })
+        Ok(Self::with_client(keypair, client))
+    }
+
+    /// Create a new client from a keypair and an already configured pubky client
+    ///
+    /// Use this to reach a testnet, custom pkarr relays, or non-default timeouts.
+    pub fn with_client(keypair: Keypair, client: pubky::Client) -> Self {
+        Self { client, keypair }
     }
 
     /// Create a new client from a recovery file
@@ -94,11 +101,57 @@ impl PrivateMessengerClient {
     }
 
     /// Sign in to Pubky
-    pub async fn sign_in(&self) -> Result<pubky_common::session::Session> {
+    pub async fn sign_in(&self) -> Result<Session> {
         self.client
             .signin(&self.keypair)
             .await
             .map_err(|e| anyhow!("Failed to sign in: {}", e))
+    }
+
+    /// Create an account on a homeserver and publish it as this identity's homeserver
+    ///
+    /// # Parameters
+    /// - `homeserver`: The homeserver's public key
+    /// - `signup_token`: Invite token, if the homeserver requires one
+    pub async fn sign_up(
+        &self,
+        homeserver: &PublicKey,
+        signup_token: Option<&str>,
+    ) -> Result<Session> {
+        self.client
+            .signup(&self.keypair, homeserver, signup_token)
+            .await
+            .map_err(|e| anyhow!("Failed to sign up: {}", e))
+    }
+
+    /// Sign in, creating an account on `homeserver` if this identity has none yet
+    ///
+    /// Sign-up is only attempted when sign-in fails and no homeserver record can be
+    /// resolved for this key. If a record exists, the sign-in error is returned
+    /// instead: signing up would republish the record and point the identity away
+    /// from the homeserver that holds its data.
+    pub async fn ensure_session(
+        &self,
+        homeserver: &PublicKey,
+        signup_token: Option<&str>,
+    ) -> Result<Session> {
+        let sign_in_error = match self.sign_in().await {
+            Ok(session) => return Ok(session),
+            Err(e) => e,
+        };
+
+        let has_homeserver_record = self
+            .client
+            .pkarr()
+            .resolve_most_recent(&self.keypair.public_key())
+            .await
+            .is_some_and(|packet| packet.resource_records("_pubky").next().is_some());
+
+        if has_homeserver_record {
+            return Err(sign_in_error);
+        }
+
+        self.sign_up(homeserver, signup_token).await
     }
 
     /// Send an encrypted message to a recipient
@@ -366,6 +419,11 @@ impl PrivateMessengerClient {
     /// Get the public key as a string
     pub fn public_key_string(&self) -> String {
         self.keypair.public_key().to_string()
+    }
+
+    /// Get the keypair of this client, including its secret key
+    pub fn keypair(&self) -> &Keypair {
+        &self.keypair
     }
 
     /// Delete a single message by its ID from a conversation

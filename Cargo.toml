@@ -37,6 +37,7 @@ futures = "0.3"
 
 [dev-dependencies]
 chrono = "0.4"
+pubky-testnet = "0.1.2"
 rpassword = "7"
 tokio = { version = "1.44.0", features = ["full", "test-util"] }
 
