@@ -65,7 +65,7 @@ Each encrypted message contains:
 `encrypted_sender` and `encrypted_content` are each the output of `pubky_common::crypto::encrypt`, keyed with the 32-byte shared secret:
 
 ```
-nonce (24 bytes, random per field) || ciphertext || Poly1305 tag (16 bytes)
+nonce (24 bytes, random per field) || Poly1305 tag (16 bytes) || ciphertext
 ```
 
 An empty plaintext encrypts to an empty byte string, with no nonce or tag.
