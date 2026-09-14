@@ -8,8 +8,8 @@ use tokio::sync::Semaphore;
 use crate::crypto::ConversationKey;
 use crate::message::DecryptedMessage;
 use crate::receive::{
-    conversation_directories, decrypt_message, FetchConfig, FetchFailure, Requests, Resource,
-    Transport,
+    conversation_directories, decrypt_message, is_message_url, message_urls, outside_conversation,
+    FetchConfig, FetchFailure, Requests, Resource, Transport,
 };
 
 /// Where a message is published, known from a directory listing before its body is downloaded
@@ -113,7 +113,8 @@ pub struct Discovery {
     /// Unacknowledged messages in listing order, the reader's own directory first. Under
     /// [`ChangePolicy::Revalidate`], acknowledged messages to recheck follow them.
     pub pending: Vec<PendingMessage>,
-    /// Listings that could not be read. Nothing from those directories is pending.
+    /// Listings that could not be read, and listed entries that are not files in the
+    /// conversation. Neither has anything pending.
     pub failures: Vec<FetchFailure>,
 }
 
@@ -159,12 +160,12 @@ pub(crate) async fn discover<T: Transport>(
     state: &mut ReceiveState,
 ) -> Result<Discovery> {
     let key = ConversationKey::derive(keypair, other_pubky)?;
-    let publishers = [keypair.public_key().to_string(), other_pubky.to_string()];
-    if let Some(stranger) = state
-        .acknowledged
-        .keys()
-        .find(|publisher| !publishers.contains(*publisher))
-    {
+    let publishers = publishers(keypair, other_pubky, &key);
+    if let Some(stranger) = state.acknowledged.keys().find(|stranger| {
+        !publishers
+            .iter()
+            .any(|(publisher, _)| publisher == *stranger)
+    }) {
         return Err(anyhow!(
             "Receive state belongs to another conversation: it holds messages published by {}",
             stranger
@@ -172,16 +173,24 @@ pub(crate) async fn discover<T: Transport>(
     }
 
     let requests = Requests::new(transport, client_permits, config);
-    let directories = conversation_directories(keypair, other_pubky, &key);
-    let listings = join_all(directories.iter().map(|url| requests.list(url))).await;
+    let listings = join_all(
+        publishers
+            .iter()
+            .map(|(_, directory)| requests.list(directory)),
+    )
+    .await;
 
     let revalidate = state.change_policy == ChangePolicy::Revalidate;
     let mut unacknowledged = Vec::new();
     let mut revalidations = Vec::new();
     let mut failures = Vec::new();
-    for (publisher, listing) in publishers.into_iter().zip(listings) {
+    for ((publisher, directory), listing) in publishers.into_iter().zip(listings) {
         let urls = match listing {
-            Ok(urls) => urls.unwrap_or_default(),
+            Ok(entries) => {
+                let (urls, mut outside) = message_urls(&directory, entries.unwrap_or_default());
+                failures.append(&mut outside);
+                urls
+            }
             Err(failure) => {
                 failures.push(failure);
                 continue;
@@ -232,11 +241,21 @@ pub(crate) async fn retrieve<T: Transport>(
     pending: &[PendingMessage],
 ) -> Result<ReceivedMessages> {
     let key = ConversationKey::derive(keypair, other_pubky)?;
+    let publishers = publishers(keypair, other_pubky, &key);
     let requests = Requests::new(transport, client_permits, config);
 
     let results = join_all(pending.iter().map(|pending| async {
+        // Pending messages may have been stored and restored by the caller
+        let MessageId { publisher, url } = &pending.id;
+        if !publishers
+            .iter()
+            .any(|(p, directory)| p == publisher && is_message_url(directory, url))
+        {
+            return Err(outside_conversation(url.clone()));
+        }
+
         let known = pending.acknowledged_etag.as_deref();
-        let (body, etag) = match requests.retrieve(&pending.id.url, known).await? {
+        let (body, etag) = match requests.retrieve(url, known).await? {
             Resource::Found { body, etag } => (body, etag),
             Resource::NotModified | Resource::Missing => return Ok(None),
         };
@@ -272,6 +291,19 @@ pub(crate) async fn retrieve<T: Transport>(
         messages: messages.into_iter().map(|(_, received)| received).collect(),
         failures,
     })
+}
+
+/// Each participant's public key and copy of the conversation, the reader's first
+fn publishers(
+    keypair: &Keypair,
+    other_pubky: &PublicKey,
+    key: &ConversationKey,
+) -> [(String, String); 2] {
+    let [mine, theirs] = conversation_directories(keypair, other_pubky, key);
+    [
+        (keypair.public_key().to_string(), mine),
+        (other_pubky.to_string(), theirs),
+    ]
 }
 
 /// Discover and retrieve in one call
@@ -313,7 +345,7 @@ mod tests {
     use super::*;
     use crate::message::PrivateMessage;
     use crate::receive::{percent_encode, request_permits, FailureReason, MessageFetch};
-    use crate::test_server::{directory, keypair, FakeServer, Reply};
+    use crate::test_server::{directory, entries_outside, keypair, FakeServer, Reply};
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -755,6 +787,81 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(state.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listed_entries_outside_the_conversation_are_reported_without_being_requested() {
+        let c = Conversation::new(2);
+        let served = [
+            c.add(true, "0000.json", 1, "mine"),
+            c.add(false, "0001.json", 2, "theirs"),
+        ];
+        let mut outside = entries_outside(&c.bob, &c.alice.public_key());
+        outside.sort();
+        c.server
+            .list_unserved(&directory(&c.bob, &c.alice.public_key()), &outside);
+        let expected: Vec<FetchFailure> =
+            outside.iter().cloned().map(outside_conversation).collect();
+        let mut state = ReceiveState::default();
+
+        let first = c.receive(&mut state).await;
+        assert_eq!(contents(&first), ["mine", "theirs"]);
+        assert_eq!(first.failures, expected);
+        acknowledge_all(&mut state, &first);
+
+        let second = c.receive(&mut state).await;
+        assert!(second.messages.is_empty());
+        assert_eq!(second.failures, expected);
+        assert_eq!(state.len(), 2);
+        for url in &outside {
+            // Alice's message is also listed in Bob's directory, and is requested only from hers
+            let from_own_listing = usize::from(served.contains(url));
+            assert_eq!(c.server.attempts(url), from_own_listing, "{}", url);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_messages_outside_the_conversation_are_not_requested() {
+        let c = Conversation::new(1000);
+        let carol = keypair(3);
+        let mine = c.add(true, "0000.json", 1, "mine");
+        let theirs = c.add(false, "0000.json", 2, "theirs");
+        let from_carol = c
+            .server
+            .add(&carol, &c.alice.public_key(), "0000.json", 3, "carol");
+        let pending = |publisher: &Keypair, url: &str| PendingMessage {
+            id: MessageId {
+                publisher: publisher.public_key().to_string(),
+                url: url.to_string(),
+            },
+            acknowledged_etag: None,
+        };
+        let forged = [
+            pending(&c.bob, &mine),
+            pending(&carol, &from_carol),
+            pending(&c.bob, "http://127.0.0.1:9/probe"),
+        ];
+        let mut all = forged.to_vec();
+        all.push(pending(&c.bob, &theirs));
+
+        let received = retrieve(
+            &c.server,
+            &c.permits,
+            &c.config,
+            &c.alice,
+            &c.bob.public_key(),
+            &all,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(contents(&received), ["theirs"]);
+        let expected: Vec<FetchFailure> = forged
+            .iter()
+            .map(|p| outside_conversation(p.id.url.clone()))
+            .collect();
+        assert_eq!(received.failures, expected);
+        assert_eq!(c.take_counts(), (1, 1));
     }
 
     /// Requests and simulated time for Alice to read a conversation, once with `get_messages`

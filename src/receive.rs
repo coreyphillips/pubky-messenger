@@ -95,6 +95,9 @@ pub enum FailureReason {
     ListingStalled,
     /// A listing held more than `max_listing_entries` entries
     ListingTooLong,
+    /// The URL is not a file directly inside its publisher's copy of the conversation, so it
+    /// was not requested
+    OutsideConversation,
 }
 
 impl fmt::Display for FetchFailure {
@@ -105,12 +108,15 @@ impl fmt::Display for FetchFailure {
             FailureReason::Transport(error) => error.clone(),
             FailureReason::ListingStalled => "listing did not advance".to_string(),
             FailureReason::ListingTooLong => "listing exceeded max_listing_entries".to_string(),
+            FailureReason::OutsideConversation => {
+                "not a message in this conversation, not requested".to_string()
+            }
         };
-        write!(
-            f,
-            "{}: {} after {} attempt(s)",
-            self.url, reason, self.attempts
-        )
+        write!(f, "{}: {}", self.url, reason)?;
+        if self.attempts > 0 {
+            write!(f, " after {} attempt(s)", self.attempts)?;
+        }
+        Ok(())
     }
 }
 
@@ -134,14 +140,48 @@ pub(crate) trait Transport: Sync {
     ) -> BoxFuture<'a, Result<HttpResponse, String>>;
 }
 
-impl Transport for pubky::Client {
+/// Reads `pubky://` URLs the way `pubky::Client` does, but only follows redirects that stay on
+/// the origin first requested
+///
+/// `pubky::Client` follows any redirect, so a homeserver could send the reader to a loopback or
+/// internal address, and its HTTP client cannot be reconfigured.
+pub(crate) struct PubkyTransport {
+    http: reqwest::Client,
+}
+
+impl PubkyTransport {
+    pub(crate) fn new(client: &pubky::Client) -> Self {
+        let http = reqwest::ClientBuilder::from(client.pkarr().clone())
+            .redirect(same_origin_redirects())
+            .build()
+            // pubky::Client::build makes the same assumption about this configuration
+            .expect("config expected to not error");
+        Self { http }
+    }
+}
+
+pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        // The first previous URL is the one originally requested
+        if attempt.url().origin() == attempt.previous()[0].origin() {
+            reqwest::redirect::Policy::default().redirect(attempt)
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+impl Transport for PubkyTransport {
     fn get<'a>(
         &'a self,
         url: &'a str,
         if_none_match: Option<&'a str>,
     ) -> BoxFuture<'a, Result<HttpResponse, String>> {
         Box::pin(async move {
-            let mut request = pubky::Client::get(self, url);
+            let Some(location) = url.strip_prefix("pubky://") else {
+                return Err("not a pubky:// URL".to_string());
+            };
+            let mut request = self.http.get(format!("https://_pubky.{}", location));
             if let Some(etag) = if_none_match {
                 request = request.header("if-none-match", etag);
             }
@@ -197,17 +237,18 @@ pub(crate) async fn receive_messages<T: Transport>(
     let key = ConversationKey::derive(keypair, other_pubky)?;
     let requests = Requests::new(transport, client_permits, config);
 
+    let directories = conversation_directories(keypair, other_pubky, &key);
+    let listings = join_all(directories.iter().map(|url| requests.list(url))).await;
+
     let mut failures = Vec::new();
     let mut urls = Vec::new();
-    for listing in join_all(
-        conversation_directories(keypair, other_pubky, &key)
-            .iter()
-            .map(|url| requests.list(url)),
-    )
-    .await
-    {
+    for (directory, listing) in directories.iter().zip(listings) {
         match listing {
-            Ok(entries) => urls.extend(entries.unwrap_or_default()),
+            Ok(entries) => {
+                let (listed, mut outside) = message_urls(directory, entries.unwrap_or_default());
+                urls.extend(listed);
+                failures.append(&mut outside);
+            }
             Err(failure) => failures.push(failure),
         }
     }
@@ -250,6 +291,38 @@ pub(crate) fn conversation_directories(
         format!("pubky://{}{}", keypair.public_key(), path),
         format!("pubky://{}{}", other_pubky, path),
     ]
+}
+
+/// Split the entries listed for `directory` into the URLs of files directly inside it, and
+/// failures for everything else, which must not be requested
+pub(crate) fn message_urls(
+    directory: &str,
+    entries: Vec<String>,
+) -> (Vec<String>, Vec<FetchFailure>) {
+    let (inside, outside): (Vec<String>, Vec<String>) = entries
+        .into_iter()
+        .partition(|url| is_message_url(directory, url));
+    (
+        inside,
+        outside.into_iter().map(outside_conversation).collect(),
+    )
+}
+
+/// Whether `url` names a file directly inside `directory`
+///
+/// The name is limited to unreserved characters, so it cannot leave the directory through a
+/// separator, dot segment, percent escape, query or fragment.
+pub(crate) fn is_message_url(directory: &str, url: &str) -> bool {
+    url.strip_prefix(directory)
+        .is_some_and(|name| !matches!(name, "" | "." | "..") && name.bytes().all(is_unreserved))
+}
+
+pub(crate) fn outside_conversation(url: String) -> FetchFailure {
+    FetchFailure {
+        url,
+        attempts: 0,
+        reason: FailureReason::OutsideConversation,
+    }
 }
 
 pub(crate) fn decrypt_message(body: &str, key: &ConversationKey) -> Option<DecryptedMessage> {
@@ -295,6 +368,9 @@ impl<'a, T: Transport> Requests<'a, T> {
 
     /// Every entry of the directory at `url`, in the homeserver's order, or `None` if the
     /// directory does not exist
+    ///
+    /// Entries are whatever the homeserver sent. Pass them through [`message_urls`] before
+    /// requesting any.
     ///
     /// Entries published while paging may be missed if they sort before the cursor.
     pub(crate) async fn list(&self, url: &str) -> Result<Option<Vec<String>>, FetchFailure> {
@@ -429,19 +505,28 @@ fn is_retryable(status: u16) -> bool {
 pub(crate) fn percent_encode(value: &str) -> String {
     value
         .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+        .map(|byte| {
+            if is_unreserved(byte) {
                 (byte as char).to_string()
+            } else {
+                format!("%{:02X}", byte)
             }
-            _ => format!("%{:02X}", byte),
         })
         .collect()
+}
+
+fn is_unreserved(byte: u8) -> bool {
+    matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_server::{directory, keypair, FakeServer, Reply};
+    use crate::test_server::{directory, entries_outside, keypair, FakeServer, Reply};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::time::Instant;
 
     fn config(client: usize, per_conversation: usize) -> FetchConfig {
@@ -943,6 +1028,106 @@ mod tests {
 
         assert!(fetch.messages.is_empty());
         assert!(fetch.failures.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listed_entries_outside_the_conversation_are_reported_without_being_requested() {
+        let alice = keypair(1);
+        let bob = keypair(2);
+        let server = FakeServer::default();
+        let mut served = server.publish(&alice, &bob.public_key(), &[(1, "mine")]);
+        served.extend(server.publish(&bob, &alice.public_key(), &[(2, "theirs")]));
+        let mut outside = entries_outside(&bob, &alice.public_key());
+        server.list_unserved(&directory(&bob, &alice.public_key()), &outside);
+        // Hostile entries end pages and become cursors
+        let config = FetchConfig {
+            list_page_size: 2,
+            ..config(4, 4)
+        };
+
+        let fetch = receive(
+            &server,
+            &request_permits(4),
+            &config,
+            &alice,
+            &bob.public_key(),
+        )
+        .await;
+
+        assert_eq!(contents(&fetch), ["mine", "theirs"]);
+        outside.sort();
+        let expected: Vec<FetchFailure> =
+            outside.iter().cloned().map(outside_conversation).collect();
+        assert_eq!(fetch.failures, expected);
+        for url in &outside {
+            // Alice's message is also listed in Bob's directory, and is requested only from hers
+            let from_own_listing = usize::from(served.contains(url));
+            assert_eq!(server.attempts(url), from_own_listing, "{}", url);
+        }
+        assert_eq!(
+            expected[0].to_string(),
+            format!(
+                "{}: not a message in this conversation, not requested",
+                outside[0]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn redirects_are_followed_only_within_the_origin_requested() {
+        let (elsewhere, elsewhere_requests) = http_server(HashMap::new()).await;
+        let (origin, origin_requests) = http_server(HashMap::from([
+            ("/moved".to_string(), "/here".to_string()),
+            ("/away".to_string(), format!("{}/probe", elsewhere)),
+        ]))
+        .await;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(same_origin_redirects())
+            .build()
+            .unwrap();
+
+        let moved = http.get(format!("{}/moved", origin)).send().await.unwrap();
+        let away = http.get(format!("{}/away", origin)).send().await.unwrap();
+
+        assert_eq!(moved.status(), 200);
+        assert_eq!(away.status(), 302);
+        assert_eq!(
+            *origin_requests.lock().unwrap(),
+            ["/moved", "/here", "/away"]
+        );
+        assert!(elsewhere_requests.lock().unwrap().is_empty());
+    }
+
+    /// Answers a path in `redirects` with a redirect to its location, and anything else with
+    /// 200. Returns the server's origin and the paths requested.
+    async fn http_server(
+        redirects: HashMap<String, String>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0; 4096];
+                let read = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request.split_whitespace().nth(1).unwrap().to_string();
+                let response = match redirects.get(&path) {
+                    Some(location) => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        location
+                    ),
+                    None => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                };
+                seen.lock().unwrap().push(path);
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (origin, requests)
     }
 
     /// Simulated elapsed time and request concurrency for several history sizes, with a fixed

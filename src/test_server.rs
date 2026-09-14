@@ -141,6 +141,13 @@ impl FakeServer {
         self.reply(directory, vec![Reply::Body(entries.join("\n"))]);
     }
 
+    /// Add entries to a directory's listing without serving anything at them
+    pub fn list_unserved(&self, directory: &str, extra: &[String]) {
+        let mut entries = self.entries(directory);
+        entries.extend_from_slice(extra);
+        self.reply(directory, vec![Reply::Body(entries.join("\n"))]);
+    }
+
     pub fn reply(&self, url: &str, replies: Vec<Reply>) {
         self.routes.lock().unwrap().insert(url.to_string(), replies);
     }
@@ -345,6 +352,32 @@ fn percent_decode(value: &str) -> String {
 pub fn directory(owner: &Keypair, other: &PublicKey) -> String {
     let path = ConversationKey::derive(owner, other).unwrap().path();
     format!("pubky://{}{}", owner.public_key(), path)
+}
+
+/// Entries a hostile homeserver could list in `owner`'s copy of the conversation that do not
+/// name a file in it
+pub fn entries_outside(owner: &Keypair, other: &PublicKey) -> Vec<String> {
+    let listed = directory(owner, other);
+    let owner_key = owner.public_key().to_string();
+    let path = &listed[format!("pubky://{}", owner_key).len()..];
+    vec![
+        "http://127.0.0.1:9/probe".to_string(),
+        "https://example.com/0000.json".to_string(),
+        format!("pubky://{}@127.0.0.1:9{}0000.json", owner_key, path),
+        format!("pubky://{}/pub/pubky.app/profile.json", owner_key),
+        // The other participant's copy, and another conversation of the owner's
+        format!("pubky://{}{}0000.json", other, path),
+        format!("{}0000.json", directory(owner, &keypair(99).public_key())),
+        listed.clone(),
+        format!("{}.", listed),
+        format!("{}..", listed),
+        format!("{}../../pubky.app/profile.json", listed),
+        format!("{}%2e%2e/%2e%2e/profile.json", listed),
+        format!("{}..\\..\\profile.json", listed),
+        format!("{}nested/0000.json", listed),
+        format!("{}0000.json?probe", listed),
+        format!("{}0000.json#probe", listed),
+    ]
 }
 
 pub fn keypair(seed: u8) -> Keypair {

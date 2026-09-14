@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["full"] }
 pubky = "0.4"
 pubky-common = "0.3"
 pkarr = "3.7"
+# The version pubky 0.4 builds on, so its pkarr client converts into a reqwest builder
+reqwest = { version = "0.12", default-features = false }
 
 # Cryptography
 blake3 = "1.5"

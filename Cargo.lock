@@ -2207,6 +2207,7 @@ dependencies = [
  "pubky",
  "pubky-common",
  "pubky-testnet",
+ "reqwest",
  "rpassword",
  "serde",
  "serde_json",
