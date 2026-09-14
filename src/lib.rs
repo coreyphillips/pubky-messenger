@@ -35,6 +35,7 @@
 //! # }
 //! ```
 
+mod clear;
 mod client;
 mod crypto;
 mod incremental;

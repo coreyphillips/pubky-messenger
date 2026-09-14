@@ -26,7 +26,7 @@ pub enum Reply {
 }
 
 /// Serves files and paged directory listings with injected latency, and records concurrency,
-/// attempts and request counts
+/// attempts (of reads and deletes) and request counts
 #[derive(Default)]
 pub struct FakeServer {
     /// Replies per URL without its query, one per attempt, the last one repeating. Unknown URLs
@@ -56,6 +56,8 @@ pub struct ServerState {
     /// Message requests answered with a body
     pub bodies_sent: usize,
     pub not_modified: usize,
+    /// URLs removed by successful deletes, in order
+    pub deleted: Vec<String>,
 }
 
 struct InFlight<'a> {
@@ -325,6 +327,20 @@ impl Transport for FakeServer {
                 Reply::Hang => futures::future::pending().await,
                 Reply::Broken => Err("connection reset".to_string()),
             }
+        })
+    }
+
+    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<u16, String>> {
+        Box::pin(async move {
+            let (_, _in_flight) = self.begin(url);
+            tokio::time::sleep(self.latency).await;
+
+            if !self.routes.lock().unwrap().contains_key(url) {
+                return Ok(404);
+            }
+            self.remove(url);
+            self.state.lock().unwrap().deleted.push(url.to_string());
+            Ok(200)
         })
     }
 }
