@@ -11,7 +11,9 @@ use crate::incremental::{
     discover, receive_new, retrieve, Discovery, PendingMessage, ReceiveState, ReceivedMessages,
 };
 use crate::message::{DecryptedMessage, PrivateMessage};
-use crate::receive::{receive_messages, request_permits, FetchConfig, MessageFetch};
+use crate::receive::{
+    receive_messages, request_permits, FetchConfig, MessageFetch, PubkyTransport,
+};
 
 /// Profile information from Pubky
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -32,6 +34,8 @@ pub struct FollowedUser {
 /// Main client for private messaging
 pub struct PrivateMessengerClient {
     client: pubky::Client,
+    /// Reads conversations, which peer-operated homeservers must not redirect elsewhere
+    reader: PubkyTransport,
     keypair: Keypair,
     fetch_config: FetchConfig,
     request_permits: Semaphore,
@@ -53,6 +57,7 @@ impl PrivateMessengerClient {
     pub fn with_client(keypair: Keypair, client: pubky::Client) -> Self {
         let fetch_config = FetchConfig::default();
         Self {
+            reader: PubkyTransport::new(&client),
             client,
             keypair,
             request_permits: request_permits(fetch_config.max_concurrent_requests),
@@ -227,7 +232,7 @@ impl PrivateMessengerClient {
     /// Requests run concurrently within this client's [`FetchConfig`] limits.
     pub async fn fetch_messages(&self, other_pubky: &PublicKey) -> Result<MessageFetch> {
         receive_messages(
-            &self.client,
+            &self.reader,
             &self.request_permits,
             &self.fetch_config,
             &self.keypair,
@@ -248,7 +253,7 @@ impl PrivateMessengerClient {
         state: &mut ReceiveState,
     ) -> Result<ReceivedMessages> {
         receive_new(
-            &self.client,
+            &self.reader,
             &self.request_permits,
             &self.fetch_config,
             &self.keypair,
@@ -268,7 +273,7 @@ impl PrivateMessengerClient {
         state: &mut ReceiveState,
     ) -> Result<Discovery> {
         discover(
-            &self.client,
+            &self.reader,
             &self.request_permits,
             &self.fetch_config,
             &self.keypair,
@@ -285,7 +290,7 @@ impl PrivateMessengerClient {
         pending: &[PendingMessage],
     ) -> Result<ReceivedMessages> {
         retrieve(
-            &self.client,
+            &self.reader,
             &self.request_permits,
             &self.fetch_config,
             &self.keypair,
