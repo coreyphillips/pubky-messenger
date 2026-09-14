@@ -142,10 +142,9 @@ impl PrivateMessengerClient {
 
         let has_homeserver_record = self
             .client
-            .pkarr()
-            .resolve_most_recent(&self.keypair.public_key())
+            .get_homeserver(&self.keypair.public_key())
             .await
-            .is_some_and(|packet| packet.resource_records("_pubky").next().is_some());
+            .is_some();
 
         if has_homeserver_record {
             return Err(sign_in_error);
