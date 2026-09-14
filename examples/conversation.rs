@@ -1,16 +1,10 @@
 use anyhow::Result;
-use pubky_messenger::{DecryptedMessage, PrivateMessengerClient, PublicKey};
-use std::collections::HashSet;
+use pubky_messenger::{DecryptedMessage, PrivateMessengerClient, PublicKey, ReceiveState};
 use std::env;
 use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-
-struct ChatState {
-    messages: Vec<DecryptedMessage>,
-    seen_timestamps: HashSet<u64>,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,19 +48,17 @@ async fn main() -> Result<()> {
     println!("=== Conversation with {} ===", peer_pubky_str);
     println!("Type your message and press Enter to send. Press Ctrl+C to exit.\n");
 
-    // Fetch initial messages
-    let initial_messages = client.get_messages(&peer).await?;
-    let mut chat_state = ChatState {
-        messages: initial_messages.clone(),
-        seen_timestamps: initial_messages
-            .iter()
-            .map(|m| (m.timestamp, m.sender.clone()))
-            .map(|(t, s)| t ^ s.bytes().fold(0u64, |acc, b| acc.rotate_left(7) ^ b as u64))
-            .collect(),
-    };
+    // Fetch initial messages, and remember them so polling downloads only new ones
+    let mut receive_state = ReceiveState::default();
+    let initial = client.receive_new_messages(&peer, &mut receive_state).await?;
+    let mut messages = Vec::new();
+    for item in &initial.messages {
+        messages.extend(item.message.clone());
+        receive_state.acknowledge(item);
+    }
 
     // Display last 10 messages
-    let recent_messages: Vec<_> = chat_state.messages.iter().rev().take(10).rev().collect();
+    let recent_messages: Vec<_> = messages.iter().rev().take(10).rev().collect();
 
     for msg in recent_messages {
         display_message(msg, &client.public_key_string());
@@ -121,11 +113,6 @@ async fn main() -> Result<()> {
                             verified: true,
                         };
 
-                        // Update state
-                        let msg_hash = local_msg.timestamp ^ local_msg.sender.bytes().fold(0u64, |acc, b| acc.rotate_left(7) ^ b as u64);
-                        chat_state.seen_timestamps.insert(msg_hash);
-                        chat_state.messages.push(local_msg.clone());
-
                         // Display the sent message
                         print!("\x1B[1A\x1B[K"); // Move up and clear line
                         display_message(&local_msg, &client.public_key_string());
@@ -142,21 +129,18 @@ async fn main() -> Result<()> {
 
             // Poll for new messages
             _ = poll_timer.tick() => {
-                match client.get_messages(&peer).await {
-                    Ok(messages) => {
+                match client.receive_new_messages(&peer, &mut receive_state).await {
+                    Ok(received) => {
                         let mut new_messages = Vec::new();
 
-                        for msg in messages {
-                            let msg_hash = msg.timestamp ^ msg.sender.bytes().fold(0u64, |acc, b| acc.rotate_left(7) ^ b as u64);
-                            if !chat_state.seen_timestamps.contains(&msg_hash) {
-                                chat_state.seen_timestamps.insert(msg_hash);
-                                chat_state.messages.push(msg.clone());
-
-                                // Only display messages from the peer
+                        for item in &received.messages {
+                            // Only display messages from the peer
+                            if let Some(msg) = &item.message {
                                 if msg.sender != client.public_key_string() {
-                                    new_messages.push(msg);
+                                    new_messages.push(msg.clone());
                                 }
                             }
+                            receive_state.acknowledge(item);
                         }
 
                         // Display new messages

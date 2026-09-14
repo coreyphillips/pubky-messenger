@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::crypto::generate_conversation_path;
+use crate::incremental::{
+    discover, receive_new, retrieve, Discovery, PendingMessage, ReceiveState, ReceivedMessages,
+};
 use crate::message::{DecryptedMessage, PrivateMessage};
 use crate::receive::{receive_messages, request_permits, FetchConfig, MessageFetch};
 
@@ -229,6 +232,65 @@ impl PrivateMessengerClient {
             &self.fetch_config,
             &self.keypair,
             other_pubky,
+        )
+        .await
+    }
+
+    /// Get the messages in a conversation that `state` has not acknowledged
+    ///
+    /// Lists both participants' directories, then downloads only the bodies of messages not
+    /// acknowledged in `state`. Acknowledge each message with [`ReceiveState::acknowledge`]
+    /// once it has been processed. Messages that could not be retrieved are reported in
+    /// `failures` and returned again by the next call.
+    pub async fn receive_new_messages(
+        &self,
+        other_pubky: &PublicKey,
+        state: &mut ReceiveState,
+    ) -> Result<ReceivedMessages> {
+        receive_new(
+            &self.client,
+            &self.request_permits,
+            &self.fetch_config,
+            &self.keypair,
+            other_pubky,
+            state,
+        )
+        .await
+    }
+
+    /// List a conversation and return the messages `state` has not acknowledged, without
+    /// downloading them
+    ///
+    /// Also drops acknowledgements for messages that are no longer listed.
+    pub async fn discover_messages(
+        &self,
+        other_pubky: &PublicKey,
+        state: &mut ReceiveState,
+    ) -> Result<Discovery> {
+        discover(
+            &self.client,
+            &self.request_permits,
+            &self.fetch_config,
+            &self.keypair,
+            other_pubky,
+            state,
+        )
+        .await
+    }
+
+    /// Download and decrypt messages returned by [`Self::discover_messages`]
+    pub async fn retrieve_messages(
+        &self,
+        other_pubky: &PublicKey,
+        pending: &[PendingMessage],
+    ) -> Result<ReceivedMessages> {
+        retrieve(
+            &self.client,
+            &self.request_permits,
+            &self.fetch_config,
+            &self.keypair,
+            other_pubky,
+            pending,
         )
         .await
     }
