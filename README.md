@@ -176,7 +176,8 @@ retrieved together with the failures.
 
 Requests run concurrently, bounded per conversation and across the whole client, with a
 deadline and retries for timeouts, transport errors, 429 and 5xx responses. See `FetchConfig`
-for the defaults and the exact retry policy.
+for the defaults and the exact retry policy. Listings are read page by page until the homeserver
+returns an empty page, so conversations longer than one page are read in full.
 
 ```rust
 use pubky_messenger::FetchConfig;
@@ -194,6 +195,49 @@ for failure in &fetch.failures {
     eprintln!("not retrieved: {}", failure);
 }
 ```
+
+### Receiving New Messages
+
+`get_messages` downloads and decrypts every message on each call. To poll a conversation,
+keep a `ReceiveState` and call `receive_new_messages`. It lists both participants' directories
+and downloads only messages the state has not acknowledged, so polling an unchanged
+conversation costs listing requests and nothing else.
+
+```rust
+use pubky_messenger::ReceiveState;
+
+// Restore a saved state, or start from ReceiveState::default() on the first run
+let mut state: ReceiveState = match std::fs::read("state.json") {
+    Ok(saved) => serde_json::from_slice(&saved)?,
+    Err(_) => ReceiveState::default(),
+};
+
+let received = client.receive_new_messages(&recipient, &mut state).await?;
+for item in &received.messages {
+    if let Some(message) = &item.message {
+        println!("{}: {}", message.sender, message.content);
+    }
+    // Acknowledge after processing, including bodies that could not be decrypted
+    state.acknowledge(item);
+}
+std::fs::write("state.json", serde_json::to_vec(&state)?)?;
+```
+
+- Delivery is at least once. A message is returned again until it is acknowledged, so
+  failed downloads and crashes before saving the state are retried. `MessageId` (publisher
+  and URL) identifies a message across calls.
+- Discovery and retrieval can run separately: `discover_messages` lists `PendingMessage`s, each
+  with its `MessageId`, in `Discovery::pending` without downloading anything.
+  `retrieve_messages` downloads the `PendingMessage`s you pass it.
+- Listings are read in full on every call. Message names are random UUIDs, so a new message
+  can sort anywhere in a listing and there is no position to resume from.
+- The state keeps one entry per acknowledged message that is still listed. Entries for
+  deleted messages are dropped at the next complete listing.
+- `ChangePolicy::WriteOnce`, the default, never requests an acknowledged message again, so a
+  message rewritten in place is not seen. This library never rewrites messages.
+  `ChangePolicy::Revalidate` sends a conditional request for every acknowledged message on
+  each call. Unchanged messages cost a request but no body, and changed ones are delivered
+  again with `updated` set.
 
 ### Managing Messages
 
@@ -237,6 +281,9 @@ The main client for interacting with the Pubky messaging system.
 - `with_fetch_config(self, config: FetchConfig) -> Self` - Set concurrency limits, deadlines and retries for reading messages
 - `get_messages(&self, other: &PublicKey) -> Result<Vec<DecryptedMessage>>` - Get conversation messages, failing if any could not be retrieved
 - `fetch_messages(&self, other: &PublicKey) -> Result<MessageFetch>` - Get the conversation messages that could be retrieved, and what could not
+- `receive_new_messages(&self, other: &PublicKey, state: &mut ReceiveState) -> Result<ReceivedMessages>` - Get the messages `state` has not acknowledged
+- `discover_messages(&self, other: &PublicKey, state: &mut ReceiveState) -> Result<Discovery>` - List the messages `state` has not acknowledged, without downloading them
+- `retrieve_messages(&self, other: &PublicKey, pending: &[PendingMessage]) -> Result<ReceivedMessages>` - Download and decrypt discovered messages
 - `delete_message(&self, message_id: &str, other: &PublicKey) -> Result<()>` - Delete a single message
 - `delete_messages(&self, message_ids: Vec<String>, other: &PublicKey) -> Result<()>` - Delete multiple messages
 - `clear_messages(&self, other: &PublicKey) -> Result<()>` - Clear all sent messages in a conversation
@@ -251,6 +298,8 @@ The main client for interacting with the Pubky messaging system.
 - `DecryptedMessage` - A decrypted message with sender, content, timestamp, and verification status
 - `FetchConfig` - Concurrency limits, request deadline and retry policy for reading messages
 - `MessageFetch` - Retrieved messages and a `FetchFailure` for each listing or message that could not be retrieved
+- `ReceiveState` - Serializable record of acknowledged messages in one conversation, with its `ChangePolicy`
+- `ReceivedMessage` - A retrieved message with its `MessageId`, entity tag, and whether it changed since it was acknowledged
 - `PubkyProfile` - User profile information (name, bio, image, status)
 - `FollowedUser` - Information about a followed user
 
@@ -334,7 +383,7 @@ cargo run --example conversation -- recovery.pkarr pk:q9x5sfjbpajdebk45b9jashgb8
 This example provides a real-time chat experience:
 - Shows the last 10 messages when starting
 - Allows you to type and send messages interactively
-- Automatically checks for new messages every 3 seconds
+- Automatically checks for new messages every 3 seconds, downloading only new ones
 - Displays messages with timestamps in HH:MM:SS format
 - Press Ctrl+C to exit the chat session
 

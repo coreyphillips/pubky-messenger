@@ -26,7 +26,7 @@ use crate::message::{DecryptedMessage, PrivateMessage};
 pub struct FetchConfig {
     /// Requests in flight across every conversation being read by this client
     pub max_concurrent_requests: usize,
-    /// Requests in flight for one `get_messages` or `fetch_messages` call
+    /// Requests in flight for one call that reads a conversation
     pub max_concurrent_requests_per_conversation: usize,
     /// Deadline for one attempt, from sending the request to reading the whole body
     pub request_timeout: Duration,
@@ -36,6 +36,14 @@ pub struct FetchConfig {
     pub retry_base_delay: Duration,
     /// Longest wait before a retry
     pub max_retry_delay: Duration,
+    /// Entries requested per page of a directory listing
+    ///
+    /// A listing is read until the homeserver returns an empty page, because a homeserver
+    /// may return fewer entries than requested before the end.
+    pub list_page_size: u16,
+    /// Entries one directory listing may hold before it fails, so a homeserver that keeps
+    /// returning new pages cannot keep a read going forever
+    pub max_listing_entries: usize,
 }
 
 impl Default for FetchConfig {
@@ -47,6 +55,9 @@ impl Default for FetchConfig {
             max_attempts: 3,
             retry_base_delay: Duration::from_millis(500),
             max_retry_delay: Duration::from_secs(10),
+            // Pubky homeservers cap pages at 1000 entries
+            list_page_size: 1000,
+            max_listing_entries: 100_000,
         }
     }
 }
@@ -80,6 +91,10 @@ pub enum FailureReason {
     TimedOut,
     /// The request failed before a response arrived
     Transport(String),
+    /// A listing page did not advance past the previous page, so paging would never end
+    ListingStalled,
+    /// A listing held more than `max_listing_entries` entries
+    ListingTooLong,
 }
 
 impl fmt::Display for FetchFailure {
@@ -88,6 +103,8 @@ impl fmt::Display for FetchFailure {
             FailureReason::Status(status) => format!("status {}", status),
             FailureReason::TimedOut => "timed out".to_string(),
             FailureReason::Transport(error) => error.clone(),
+            FailureReason::ListingStalled => "listing did not advance".to_string(),
+            FailureReason::ListingTooLong => "listing exceeded max_listing_entries".to_string(),
         };
         write!(
             f,
@@ -104,28 +121,44 @@ pub(crate) fn request_permits(limit: usize) -> Semaphore {
 pub(crate) struct HttpResponse {
     pub status: u16,
     pub retry_after: Option<Duration>,
+    pub etag: Option<String>,
     pub body: String,
 }
 
 pub(crate) trait Transport: Sync {
-    fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>>;
+    /// GET `url`, answered with 304 if its entity tag matches `if_none_match`
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        if_none_match: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<HttpResponse, String>>;
 }
 
 impl Transport for pubky::Client {
-    fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>> {
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        if_none_match: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<HttpResponse, String>> {
         Box::pin(async move {
-            let response = pubky::Client::get(self, url)
-                .send()
-                .await
-                .map_err(|e| error_chain(&e))?;
+            let mut request = pubky::Client::get(self, url);
+            if let Some(etag) = if_none_match {
+                request = request.header("if-none-match", etag);
+            }
+            let response = request.send().await.map_err(|e| error_chain(&e))?;
 
             let status = response.status();
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<u64>().ok())
+            let header = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.trim().to_string())
+            };
+            let retry_after = header("retry-after")
+                .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_secs);
+            let etag = header("etag");
             let body = if status.is_success() {
                 response.text().await.map_err(|e| error_chain(&e))?
             } else {
@@ -135,6 +168,7 @@ impl Transport for pubky::Client {
             Ok(HttpResponse {
                 status: status.as_u16(),
                 retry_after,
+                etag,
                 body,
             })
         })
@@ -161,25 +195,19 @@ pub(crate) async fn receive_messages<T: Transport>(
     other_pubky: &PublicKey,
 ) -> Result<MessageFetch> {
     let key = ConversationKey::derive(keypair, other_pubky)?;
-    let path = key.path();
-    let directories = [
-        format!("pubky://{}{}", keypair.public_key(), path),
-        format!("pubky://{}{}", other_pubky, path),
-    ];
-
-    let requests = Requests {
-        transport,
-        client_permits,
-        conversation_permits: request_permits(config.max_concurrent_requests_per_conversation),
-        config,
-    };
+    let requests = Requests::new(transport, client_permits, config);
 
     let mut failures = Vec::new();
     let mut urls = Vec::new();
-    for listing in join_all(directories.iter().map(|url| requests.retrieve(url))).await {
+    for listing in join_all(
+        conversation_directories(keypair, other_pubky, &key)
+            .iter()
+            .map(|url| requests.list(url)),
+    )
+    .await
+    {
         match listing {
-            Ok(Some(body)) => urls.extend(body.lines().map(String::from)),
-            Ok(None) => {}
+            Ok(entries) => urls.extend(entries.unwrap_or_default()),
             Err(failure) => failures.push(failure),
         }
     }
@@ -187,8 +215,10 @@ pub(crate) async fn receive_messages<T: Transport>(
     // Decrypt each body as it arrives, because join_all keeps every output until the last
     // request finishes
     let results = join_all(urls.iter().map(|url| async {
-        let body = requests.retrieve(url).await?;
-        Ok(body.and_then(|body| decrypt_message(&body, &key)))
+        Ok(match requests.retrieve(url, None).await? {
+            Resource::Found { body, .. } => decrypt_message(&body, &key),
+            Resource::NotModified | Resource::Missing => None,
+        })
     }))
     .await;
 
@@ -209,7 +239,20 @@ pub(crate) async fn receive_messages<T: Transport>(
     })
 }
 
-fn decrypt_message(body: &str, key: &ConversationKey) -> Option<DecryptedMessage> {
+/// The reader's copy of the conversation, then the other participant's
+pub(crate) fn conversation_directories(
+    keypair: &Keypair,
+    other_pubky: &PublicKey,
+    key: &ConversationKey,
+) -> [String; 2] {
+    let path = key.path();
+    [
+        format!("pubky://{}{}", keypair.public_key(), path),
+        format!("pubky://{}{}", other_pubky, path),
+    ]
+}
+
+pub(crate) fn decrypt_message(body: &str, key: &ConversationKey) -> Option<DecryptedMessage> {
     let message = serde_json::from_str::<PrivateMessage>(body).ok()?;
     let content = message.decrypt_content_with(key).ok()?;
     let sender = message.decrypt_sender_with(key).ok()?;
@@ -223,26 +266,106 @@ fn decrypt_message(body: &str, key: &ConversationKey) -> Option<DecryptedMessage
     })
 }
 
-struct Requests<'a, T> {
+pub(crate) enum Resource {
+    Found { body: String, etag: Option<String> },
+    NotModified,
+    Missing,
+}
+
+pub(crate) struct Requests<'a, T> {
     transport: &'a T,
     client_permits: &'a Semaphore,
     conversation_permits: Semaphore,
     config: &'a FetchConfig,
 }
 
-impl<T: Transport> Requests<'_, T> {
-    /// The body at `url`, or `None` if nothing exists there
-    async fn retrieve(&self, url: &str) -> Result<Option<String>, FetchFailure> {
+impl<'a, T: Transport> Requests<'a, T> {
+    pub(crate) fn new(
+        transport: &'a T,
+        client_permits: &'a Semaphore,
+        config: &'a FetchConfig,
+    ) -> Self {
+        Self {
+            transport,
+            client_permits,
+            conversation_permits: request_permits(config.max_concurrent_requests_per_conversation),
+            config,
+        }
+    }
+
+    /// Every entry of the directory at `url`, in the homeserver's order, or `None` if the
+    /// directory does not exist
+    ///
+    /// Entries published while paging may be missed if they sort before the cursor.
+    pub(crate) async fn list(&self, url: &str) -> Result<Option<Vec<String>>, FetchFailure> {
+        let page_size = self.config.list_page_size.max(1);
+        let mut entries: Vec<String> = Vec::new();
+
+        loop {
+            let page_url = match entries.last() {
+                None => format!("{}?limit={}", url, page_size),
+                Some(cursor) => format!(
+                    "{}?limit={}&cursor={}",
+                    url,
+                    page_size,
+                    percent_encode(cursor)
+                ),
+            };
+            let page = match self.retrieve(&page_url, None).await? {
+                Resource::Found { body, .. } => body,
+                Resource::Missing if entries.is_empty() => return Ok(None),
+                // Emptied while paging
+                Resource::Missing | Resource::NotModified => break,
+            };
+
+            let page: Vec<String> = page
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(String::from)
+                .collect();
+            match (entries.last(), page.last()) {
+                (_, None) => break,
+                (Some(cursor), Some(last)) if last <= cursor => {
+                    return Err(FetchFailure {
+                        url: page_url,
+                        attempts: 1,
+                        reason: FailureReason::ListingStalled,
+                    })
+                }
+                _ => entries.extend(page),
+            }
+            if entries.len() > self.config.max_listing_entries {
+                return Err(FetchFailure {
+                    url: page_url,
+                    attempts: 1,
+                    reason: FailureReason::ListingTooLong,
+                });
+            }
+        }
+
+        Ok(Some(entries))
+    }
+
+    /// The resource at `url`, unless its entity tag matches `if_none_match`
+    pub(crate) async fn retrieve(
+        &self,
+        url: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<Resource, FetchFailure> {
         let max_attempts = self.config.max_attempts.max(1);
         let mut attempts = 0;
 
         loop {
             attempts += 1;
-            let (reason, retry_after) = match self.attempt(url).await {
+            let (reason, retry_after) = match self.attempt(url, if_none_match).await {
                 Ok(Ok(response)) if (200..300).contains(&response.status) => {
-                    return Ok(Some(response.body))
+                    return Ok(Resource::Found {
+                        body: response.body,
+                        etag: response.etag,
+                    })
                 }
-                Ok(Ok(response)) if response.status == 404 => return Ok(None),
+                Ok(Ok(response)) if response.status == 304 => return Ok(Resource::NotModified),
+                Ok(Ok(response)) if response.status == 404 => return Ok(Resource::Missing),
                 Ok(Ok(response)) => (FailureReason::Status(response.status), response.retry_after),
                 Ok(Err(error)) => (FailureReason::Transport(error), None),
                 Err(_) => (FailureReason::TimedOut, None),
@@ -269,7 +392,11 @@ impl<T: Transport> Requests<'_, T> {
         }
     }
 
-    async fn attempt(&self, url: &str) -> Result<Result<HttpResponse, String>, Elapsed> {
+    async fn attempt(
+        &self,
+        url: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<Result<HttpResponse, String>, Elapsed> {
         // Always conversation before client, so a call waiting on its own limit holds no
         // capacity that other conversations could use
         let _conversation = self
@@ -278,7 +405,11 @@ impl<T: Transport> Requests<'_, T> {
             .await
             .expect("never closed");
         let _client = self.client_permits.acquire().await.expect("never closed");
-        tokio::time::timeout(self.config.request_timeout, self.transport.get(url)).await
+        tokio::time::timeout(
+            self.config.request_timeout,
+            self.transport.get(url, if_none_match),
+        )
+        .await
     }
 
     fn backoff(&self, attempts: u32) -> Duration {
@@ -294,189 +425,24 @@ fn is_retryable(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
+// Homeservers take the cursor as the full URL of the last entry seen
+pub(crate) fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{:02X}", byte),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use crate::test_server::{directory, keypair, FakeServer, Reply};
     use tokio::time::Instant;
-
-    #[derive(Clone)]
-    enum Reply {
-        Body(String),
-        Status(u16),
-        RateLimited { retry_after_secs: u64 },
-        Hang,
-        Broken,
-    }
-
-    /// Homeserver stand-in with injected latency that records concurrency and attempts
-    #[derive(Default)]
-    struct FakeServer {
-        /// Replies per URL, one per attempt, the last one repeating. Unknown URLs are 404.
-        routes: HashMap<String, Vec<Reply>>,
-        delays: HashMap<String, Duration>,
-        latency: Duration,
-        state: Mutex<ServerState>,
-    }
-
-    #[derive(Default)]
-    struct ServerState {
-        in_flight: usize,
-        peak: usize,
-        in_flight_by_conversation: HashMap<String, usize>,
-        peak_by_conversation: HashMap<String, usize>,
-        attempts: HashMap<String, usize>,
-        starts: Vec<(Instant, String)>,
-        requests: usize,
-    }
-
-    struct InFlight<'a> {
-        server: &'a FakeServer,
-        conversation: String,
-    }
-
-    impl Drop for InFlight<'_> {
-        fn drop(&mut self) {
-            let mut state = self.server.state.lock().unwrap();
-            state.in_flight -= 1;
-            *state
-                .in_flight_by_conversation
-                .get_mut(&self.conversation)
-                .unwrap() -= 1;
-        }
-    }
-
-    impl FakeServer {
-        fn with_latency(latency: Duration) -> Self {
-            Self {
-                latency,
-                ..Self::default()
-            }
-        }
-
-        /// Serve messages under `author`'s copy of the conversation, listed in the given order
-        fn publish(
-            &mut self,
-            author: &Keypair,
-            other: &PublicKey,
-            messages: &[(u64, &str)],
-        ) -> Vec<String> {
-            let directory = directory(author, other);
-            let urls: Vec<String> = (0..messages.len())
-                .map(|i| format!("{}{:04}.json", directory, i))
-                .collect();
-            for (url, (timestamp, content)) in urls.iter().zip(messages) {
-                let message = PrivateMessage::new_at(author, other, content, *timestamp).unwrap();
-                self.reply(
-                    url,
-                    vec![Reply::Body(serde_json::to_string(&message).unwrap())],
-                );
-            }
-            self.reply(&directory, vec![Reply::Body(urls.join("\n"))]);
-            urls
-        }
-
-        fn reply(&mut self, url: &str, replies: Vec<Reply>) {
-            self.routes.insert(url.to_string(), replies);
-        }
-
-        fn attempts(&self, url: &str) -> usize {
-            self.state
-                .lock()
-                .unwrap()
-                .attempts
-                .get(url)
-                .copied()
-                .unwrap_or(0)
-        }
-
-        fn starts_of(&self, url: &str) -> Vec<Instant> {
-            let state = self.state.lock().unwrap();
-            state
-                .starts
-                .iter()
-                .filter(|(_, u)| u == url)
-                .map(|(t, _)| *t)
-                .collect()
-        }
-
-        fn begin(&self, url: &str) -> (usize, InFlight<'_>) {
-            let conversation = url
-                .split("/private_messages/")
-                .nth(1)
-                .and_then(|rest| rest.split('/').next())
-                .unwrap_or_default()
-                .to_string();
-
-            let mut state = self.state.lock().unwrap();
-            state.requests += 1;
-            state.in_flight += 1;
-            state.peak = state.peak.max(state.in_flight);
-            let in_conversation = state
-                .in_flight_by_conversation
-                .entry(conversation.clone())
-                .or_default();
-            *in_conversation += 1;
-            let in_conversation = *in_conversation;
-            let peak = state
-                .peak_by_conversation
-                .entry(conversation.clone())
-                .or_default();
-            *peak = (*peak).max(in_conversation);
-            let attempt = state.attempts.entry(url.to_string()).or_default();
-            *attempt += 1;
-            let attempt = *attempt;
-            state.starts.push((Instant::now(), url.to_string()));
-
-            (
-                attempt,
-                InFlight {
-                    server: self,
-                    conversation,
-                },
-            )
-        }
-    }
-
-    impl Transport for FakeServer {
-        fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>> {
-            Box::pin(async move {
-                let (attempt, _in_flight) = self.begin(url);
-                tokio::time::sleep(self.delays.get(url).copied().unwrap_or(self.latency)).await;
-
-                let reply = match self.routes.get(url) {
-                    Some(replies) => replies[(attempt - 1).min(replies.len() - 1)].clone(),
-                    None => Reply::Status(404),
-                };
-                let response = |status, retry_after, body| HttpResponse {
-                    status,
-                    retry_after,
-                    body,
-                };
-                match reply {
-                    Reply::Body(body) => Ok(response(200, None, body)),
-                    Reply::Status(status) => Ok(response(status, None, String::new())),
-                    Reply::RateLimited { retry_after_secs } => Ok(response(
-                        429,
-                        Some(Duration::from_secs(retry_after_secs)),
-                        String::new(),
-                    )),
-                    Reply::Hang => futures::future::pending().await,
-                    Reply::Broken => Err("connection reset".to_string()),
-                }
-            })
-        }
-    }
-
-    fn directory(owner: &Keypair, other: &PublicKey) -> String {
-        let path = ConversationKey::derive(owner, other).unwrap().path();
-        format!("pubky://{}{}", owner.public_key(), path)
-    }
-
-    fn keypair(seed: u8) -> Keypair {
-        Keypair::from_secret_key(&[seed; 32])
-    }
 
     fn config(client: usize, per_conversation: usize) -> FetchConfig {
         FetchConfig {
@@ -486,6 +452,8 @@ mod tests {
             max_attempts: 3,
             retry_base_delay: Duration::from_secs(1),
             max_retry_delay: Duration::from_secs(10),
+            list_page_size: 1000,
+            max_listing_entries: 100_000,
         }
     }
 
@@ -524,7 +492,7 @@ mod tests {
     async fn overlapping_requests_stay_within_client_and_conversation_limits() {
         let alice = keypair(1);
         let others: Vec<Keypair> = (10..14).map(keypair).collect();
-        let mut server = FakeServer::with_latency(Duration::from_millis(100));
+        let server = FakeServer::with_latency(Duration::from_millis(100));
         for other in &others {
             server.publish(
                 &alice,
@@ -617,7 +585,7 @@ mod tests {
             path
         );
 
-        let mut server = FakeServer::default();
+        let server = FakeServer::default();
         let mut expected = Vec::new();
         for (i, entry) in fixture["messages"].as_array().unwrap().iter().enumerate() {
             let author = if entry["author"] == "alice" {
@@ -664,18 +632,15 @@ mod tests {
     async fn tampered_signatures_are_reported_unverified() {
         let alice = keypair(1);
         let bob = keypair(2);
-        let mut server = FakeServer::default();
+        let server = FakeServer::default();
         let urls = server.publish(
             &alice,
             &bob.public_key(),
             &[(1, "intact"), (2, "bad signature"), (3, "moved")],
         );
 
-        let mut tamper = |url: &str, change: &dyn Fn(&mut PrivateMessage)| {
-            let Reply::Body(body) = &server.routes[url][0] else {
-                unreachable!()
-            };
-            let mut message: PrivateMessage = serde_json::from_str(body).unwrap();
+        let tamper = |url: &str, change: &dyn Fn(&mut PrivateMessage)| {
+            let mut message: PrivateMessage = serde_json::from_str(&server.body(url)).unwrap();
             change(&mut message);
             server.reply(
                 url,
@@ -709,15 +674,13 @@ mod tests {
     async fn timed_out_attempts_release_capacity_and_retry() {
         let alice = keypair(1);
         let bob = keypair(2);
-        let mut server = FakeServer::with_latency(Duration::from_millis(100));
+        let server = FakeServer::with_latency(Duration::from_millis(100));
         let urls = server.publish(
             &alice,
             &bob.public_key(),
             &[(1, "slow once"), (2, "never arrives"), (3, "prompt")],
         );
-        let Reply::Body(slow_once) = server.routes[&urls[0]][0].clone() else {
-            unreachable!()
-        };
+        let slow_once = server.body(&urls[0]);
         server.reply(&urls[0], vec![Reply::Hang, Reply::Body(slow_once)]);
         server.reply(&urls[1], vec![Reply::Hang]);
         // A single permit: an attempt that kept it after timing out would stall everything else
@@ -744,7 +707,7 @@ mod tests {
         let alice = keypair(1);
         let bob = keypair(2);
         let carol = keypair(3);
-        let mut server = FakeServer::with_latency(Duration::from_millis(100));
+        let server = FakeServer::with_latency(Duration::from_millis(100));
         server.publish(&alice, &bob.public_key(), &[(1, "stuck")]);
         server.reply(&directory(&alice, &bob.public_key()), vec![Reply::Hang]);
         server.reply(&directory(&bob, &alice.public_key()), vec![Reply::Hang]);
@@ -772,15 +735,13 @@ mod tests {
     async fn rate_limited_requests_wait_without_holding_capacity() {
         let alice = keypair(1);
         let bob = keypair(2);
-        let mut server = FakeServer::with_latency(Duration::from_millis(100));
+        let server = FakeServer::with_latency(Duration::from_millis(100));
         let urls = server.publish(
             &alice,
             &bob.public_key(),
             &[(1, "limited"), (2, "unaffected"), (3, "gave up")],
         );
-        let Reply::Body(limited) = server.routes[&urls[0]][0].clone() else {
-            unreachable!()
-        };
+        let limited = server.body(&urls[0]);
         server.reply(
             &urls[0],
             vec![
@@ -825,7 +786,7 @@ mod tests {
     async fn failures_follow_the_retry_policy_and_are_reported() {
         let alice = keypair(1);
         let bob = keypair(2);
-        let mut server = FakeServer::with_latency(Duration::from_millis(100));
+        let server = FakeServer::with_latency(Duration::from_millis(100));
         let urls = server.publish(
             &alice,
             &bob.public_key(),
@@ -843,7 +804,7 @@ mod tests {
             &urls[2],
             vec![Reply::Broken, Reply::Broken, Reply::Status(502)],
         );
-        server.routes.remove(&urls[3]);
+        server.remove(&urls[3]);
         let bob_directory = directory(&bob, &alice.public_key());
         server.reply(&bob_directory, vec![Reply::Status(503)]);
 
@@ -865,7 +826,11 @@ mod tests {
         assert_eq!(
             fetch.failures,
             [
-                failure(&bob_directory, 3, FailureReason::Status(503)),
+                failure(
+                    &format!("{}?limit=1000", bob_directory),
+                    3,
+                    FailureReason::Status(503)
+                ),
                 failure(&urls[0], 3, FailureReason::Status(500)),
                 failure(&urls[1], 1, FailureReason::Status(403)),
                 failure(&urls[2], 3, FailureReason::Status(502)),
@@ -874,6 +839,93 @@ mod tests {
         let starts = server.starts_of(&urls[0]);
         assert_eq!(starts[1] - starts[0], Duration::from_millis(1100));
         assert_eq!(starts[2] - starts[1], Duration::from_millis(2100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listings_are_read_until_an_empty_page() {
+        let alice = keypair(1);
+        let bob = keypair(2);
+        let server = FakeServer::default();
+        server.publish(
+            &alice,
+            &bob.public_key(),
+            &as_refs(&history("from alice", 5)),
+        );
+        server.publish(&bob, &alice.public_key(), &[(9, "from bob")]);
+        let config = FetchConfig {
+            list_page_size: 2,
+            ..config(4, 4)
+        };
+
+        let fetch = receive(
+            &server,
+            &request_permits(4),
+            &config,
+            &alice,
+            &bob.public_key(),
+        )
+        .await;
+
+        assert_eq!(fetch.messages.len(), 6);
+        assert!(fetch.failures.is_empty());
+        // Alice's pages hold 2, 2, 1 and 0 entries, Bob's 1 and 0
+        assert_eq!(server.state.lock().unwrap().listing_requests, 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_that_ignores_its_cursor_fails_instead_of_paging_forever() {
+        let alice = keypair(1);
+        let bob = keypair(2);
+        let mut server = FakeServer::default();
+        server.ignores_cursor = true;
+        server.publish(&alice, &bob.public_key(), &[(1, "a"), (2, "b")]);
+        let config = FetchConfig {
+            list_page_size: 2,
+            ..config(4, 4)
+        };
+
+        let fetch = receive(
+            &server,
+            &request_permits(4),
+            &config,
+            &alice,
+            &bob.public_key(),
+        )
+        .await;
+
+        assert!(fetch.messages.is_empty());
+        assert_eq!(fetch.failures.len(), 1);
+        assert_eq!(fetch.failures[0].reason, FailureReason::ListingStalled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_longer_than_the_entry_limit_fails() {
+        let alice = keypair(1);
+        let bob = keypair(2);
+        let server = FakeServer::default();
+        server.publish(
+            &alice,
+            &bob.public_key(),
+            &as_refs(&history("from alice", 5)),
+        );
+        let config = FetchConfig {
+            list_page_size: 2,
+            max_listing_entries: 3,
+            ..config(4, 4)
+        };
+
+        let fetch = receive(
+            &server,
+            &request_permits(4),
+            &config,
+            &alice,
+            &bob.public_key(),
+        )
+        .await;
+
+        assert!(fetch.messages.is_empty());
+        assert_eq!(fetch.failures.len(), 1);
+        assert_eq!(fetch.failures[0].reason, FailureReason::ListingTooLong);
     }
 
     #[tokio::test(start_paused = true)]
@@ -911,7 +963,7 @@ mod tests {
         println!("| messages | strategy | requests | peak in flight | elapsed |");
         println!("|---|---|---|---|---|");
         for size in [10, 50, 200] {
-            let mut server = FakeServer::with_latency(latency);
+            let server = FakeServer::with_latency(latency);
             server.publish(
                 &alice,
                 &bob.public_key(),
@@ -924,7 +976,7 @@ mod tests {
             );
 
             for (name, config) in &strategies {
-                *server.state.lock().unwrap() = ServerState::default();
+                server.reset_counts();
                 let permits = request_permits(config.max_concurrent_requests);
                 let start = Instant::now();
                 let fetch = receive(&server, &permits, config, &alice, &bob.public_key()).await;

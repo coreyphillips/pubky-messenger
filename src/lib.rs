@@ -37,10 +37,17 @@
 
 mod client;
 mod crypto;
+mod incremental;
 mod message;
 mod receive;
+#[cfg(test)]
+mod test_server;
 
 pub use client::{FollowedUser, PrivateMessengerClient, PubkyProfile};
+pub use incremental::{
+    ChangePolicy, Discovery, MessageId, PendingMessage, ReceiveState, ReceivedMessage,
+    ReceivedMessages,
+};
 pub use message::{DecryptedMessage, PrivateMessage};
 pub use receive::{FailureReason, FetchConfig, FetchFailure, MessageFetch};
 
