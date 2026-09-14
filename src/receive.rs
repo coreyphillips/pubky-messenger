@@ -184,17 +184,19 @@ pub(crate) async fn receive_messages<T: Transport>(
         }
     }
 
-    let bodies = join_all(urls.iter().map(|url| requests.retrieve(url))).await;
+    // Decrypt each body as it arrives, because join_all keeps every output until the last
+    // request finishes
+    let results = join_all(urls.iter().map(|url| async {
+        let body = requests.retrieve(url).await?;
+        Ok(body.and_then(|body| decrypt_message(&body, &key)))
+    }))
+    .await;
 
     let mut messages = Vec::new();
-    for (position, body) in bodies.into_iter().enumerate() {
-        match body {
-            Ok(Some(body)) => {
-                if let Some(message) = decrypt_message(&body, &key) {
-                    messages.push((position, message));
-                }
-            }
-            // Deleted after it was listed
+    for (position, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(Some(message)) => messages.push((position, message)),
+            // Deleted after it was listed, or not a message this conversation can decrypt
             Ok(None) => {}
             Err(failure) => failures.push(failure),
         }
