@@ -57,10 +57,12 @@ Since Pubky uses Ed25519 keys for identity, these must be converted to X25519 fo
 ### 3. Message Structure
 
 Each encrypted message contains:
-- `timestamp`: Unix timestamp with nanosecond precision
-- `encrypted_sender`: Sender's public key encrypted with shared secret
-- `encrypted_content`: Message content encrypted with shared secret
-- `signature`: Ed25519 signature over (content + sender_pubky + timestamp)
+- `timestamp`: Unix timestamp in seconds, stored in plaintext
+- `encrypted_sender`: Sender's public key as its 52-character z-base-32 string, encrypted with shared secret
+- `encrypted_content`: Message content (UTF-8) encrypted with shared secret
+- `signature_bytes`: 64-byte Ed25519 signature over the message digest (see Encryption Flow)
+
+Stored JSON uses these field names, with each byte field serialized as an array of integers.
 
 `encrypted_sender` and `encrypted_content` are each the output of `pubky_common::crypto::encrypt`, keyed with the 32-byte shared secret:
 
@@ -73,7 +75,7 @@ An empty plaintext encrypts to an empty byte string, with no nonce or tag.
 ### 4. Encryption Flow
 
 1. Generate shared secret using ECDH
-2. Create message digest: `Blake3(content || sender_pubky || timestamp)`
+2. Create message digest: `Blake3(content || sender_pubky || timestamp)`, where `content` is the UTF-8 bytes, `sender_pubky` is the raw 32-byte Ed25519 public key, and `timestamp` is a big-endian u64
 3. Sign the digest with sender's Ed25519 private key
 4. Encrypt content using XSalsa20-Poly1305 with shared secret
 5. Encrypt sender identity using XSalsa20-Poly1305 with shared secret
@@ -88,7 +90,7 @@ Messages are stored on the Pubky network at deterministic paths:
 ```
 
 Where:
-- `conversation_id` = Blake3 hash of the shared secret
+- `conversation_id` = Blake3 hash of the lowercase hex encoding of the 32-byte shared secret (the 64 ASCII characters, not the raw bytes), written as lowercase hex
 - `message_id` = Randomly generated UUID v4
 
 This ensures:
