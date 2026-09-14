@@ -433,7 +433,7 @@ When writing tests that interact with the Pubky network:
 
 This library implements end-to-end encryption using:
 - X25519-ECDH for key agreement
-- ChaCha20-Poly1305 for message encryption (via pubky-common)
+- XSalsa20-Poly1305 for message encryption, with a random 24-byte nonce prepended to each ciphertext (via pubky-common)
 - Ed25519 for message signatures
 - Blake3 for hashing
 
