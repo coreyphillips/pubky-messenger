@@ -4,9 +4,11 @@ use futures::future::join_all;
 use pkarr::{Keypair, PublicKey};
 use pubky_common::{recovery_file, session::Session};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::crypto::generate_conversation_path;
 use crate::message::{DecryptedMessage, PrivateMessage};
+use crate::receive::{receive_messages, request_permits, FetchConfig, MessageFetch};
 
 /// Profile information from Pubky
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -28,6 +30,8 @@ pub struct FollowedUser {
 pub struct PrivateMessengerClient {
     client: pubky::Client,
     keypair: Keypair,
+    fetch_config: FetchConfig,
+    request_permits: Semaphore,
 }
 
 impl PrivateMessengerClient {
@@ -44,7 +48,20 @@ impl PrivateMessengerClient {
     ///
     /// Use this to reach a testnet, custom pkarr relays, or non-default timeouts.
     pub fn with_client(keypair: Keypair, client: pubky::Client) -> Self {
-        Self { client, keypair }
+        let fetch_config = FetchConfig::default();
+        Self {
+            client,
+            keypair,
+            request_permits: request_permits(fetch_config.max_concurrent_requests),
+            fetch_config,
+        }
+    }
+
+    /// Replace the concurrency limits, deadlines and retry policy used to read messages
+    pub fn with_fetch_config(mut self, fetch_config: FetchConfig) -> Self {
+        self.request_permits = request_permits(fetch_config.max_concurrent_requests);
+        self.fetch_config = fetch_config;
+        self
     }
 
     /// Create a new client from a recovery file
@@ -183,57 +200,37 @@ impl PrivateMessengerClient {
         Ok(msg_id)
     }
 
-    /// Get all messages in a conversation
+    /// Get all messages in a conversation, oldest first
+    ///
+    /// Messages with equal timestamps keep listing order: this client's directory first, then
+    /// the other participant's. Fails if any listing or message could not be retrieved under
+    /// the [`FetchConfig`] retry policy; use [`Self::fetch_messages`] to keep what was retrieved.
+    /// Messages that cannot be parsed or decrypted are skipped.
     pub async fn get_messages(&self, other_pubky: &PublicKey) -> Result<Vec<DecryptedMessage>> {
-        let mut all_messages = Vec::new();
-        let private_path = generate_conversation_path(&self.keypair, other_pubky)?;
+        let fetch = self.fetch_messages(other_pubky).await?;
 
-        // Check both user's paths
-        let self_path = format!("pubky://{}{}", self.keypair.public_key(), private_path);
-        let other_path = format!("pubky://{}{}", other_pubky, private_path);
-
-        let mut urls = Vec::new();
-
-        // Collect URLs from both paths
-        if let Ok(list_builder) = self.client.list(&self_path) {
-            if let Ok(self_urls) = list_builder.send().await {
-                urls.extend(self_urls);
-            }
+        match fetch.failures.first() {
+            None => Ok(fetch.messages),
+            Some(failure) => Err(anyhow!(
+                "Failed to retrieve {} listing(s) or message(s), including {}",
+                fetch.failures.len(),
+                failure
+            )),
         }
+    }
 
-        if let Ok(list_builder) = self.client.list(&other_path) {
-            if let Ok(other_urls) = list_builder.send().await {
-                urls.extend(other_urls);
-            }
-        }
-
-        // Process each message
-        for url in urls.iter() {
-            let response = self.client.get(url).send().await?;
-            if response.status().is_success() {
-                let response_text = response.text().await?;
-
-                if let Ok(message) = serde_json::from_str::<PrivateMessage>(&response_text) {
-                    if let Ok(content) = message.decrypt_content(&self.keypair, other_pubky) {
-                        if let Ok(sender) = message.decrypt_sender(&self.keypair, other_pubky) {
-                            let verified =
-                                message.verify_signature(&content, &sender).unwrap_or(false);
-
-                            all_messages.push(DecryptedMessage {
-                                sender,
-                                content,
-                                timestamp: message.timestamp,
-                                verified,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort by timestamp
-        all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-        Ok(all_messages)
+    /// Get the messages in a conversation that could be retrieved, and what could not
+    ///
+    /// Requests run concurrently within this client's [`FetchConfig`] limits.
+    pub async fn fetch_messages(&self, other_pubky: &PublicKey) -> Result<MessageFetch> {
+        receive_messages(
+            &self.client,
+            &self.request_permits,
+            &self.fetch_config,
+            &self.keypair,
+            other_pubky,
+        )
+        .await
     }
 
     /// Get the user's own profile
