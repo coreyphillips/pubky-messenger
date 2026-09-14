@@ -16,7 +16,7 @@ This library implements end-to-end encrypted private messaging on the Pubky netw
    - Elliptic Curve Diffie-Hellman (ECDH) key agreement
    - Derived from Ed25519 keys via cryptographic conversion
 
-3. **ChaCha20-Poly1305** - Used for:
+3. **XSalsa20-Poly1305** - Used for:
    - Authenticated encryption (AEAD) of message content and sender identity
    - Provides both confidentiality and integrity
 
@@ -62,13 +62,21 @@ Each encrypted message contains:
 - `encrypted_content`: Message content encrypted with shared secret
 - `signature`: Ed25519 signature over (content + sender_pubky + timestamp)
 
+`encrypted_sender` and `encrypted_content` are each the output of `pubky_common::crypto::encrypt`, keyed with the 32-byte shared secret:
+
+```
+nonce (24 bytes, random per field) || ciphertext || Poly1305 tag (16 bytes)
+```
+
+An empty plaintext encrypts to an empty byte string, with no nonce or tag.
+
 ### 4. Encryption Flow
 
 1. Generate shared secret using ECDH
 2. Create message digest: `Blake3(content || sender_pubky || timestamp)`
 3. Sign the digest with sender's Ed25519 private key
-4. Encrypt content using ChaCha20-Poly1305 with shared secret
-5. Encrypt sender identity using ChaCha20-Poly1305 with shared secret
+4. Encrypt content using XSalsa20-Poly1305 with shared secret
+5. Encrypt sender identity using XSalsa20-Poly1305 with shared secret
 6. Package into PrivateMessage structure
 
 ## Message Storage
@@ -131,7 +139,7 @@ Clients check both potential message locations:
 ### Dependencies
 
 - `pubky`: Core Pubky functionality and key management
-- `pubky_common::crypto`: ChaCha20-Poly1305 encryption
+- `pubky_common::crypto`: XSalsa20-Poly1305 encryption
 - `ed25519-dalek`: Ed25519 signatures
 - `x25519-dalek`: X25519 key agreement
 - `blake3`: Hashing
