@@ -6,6 +6,7 @@ use pubky_common::{recovery_file, session::Session};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
+use crate::clear::clear_messages;
 use crate::crypto::generate_conversation_path;
 use crate::incremental::{
     discover, receive_new, retrieve, Discovery, PendingMessage, ReceiveState, ReceivedMessages,
@@ -34,8 +35,8 @@ pub struct FollowedUser {
 /// Main client for private messaging
 pub struct PrivateMessengerClient {
     client: pubky::Client,
-    /// Reads conversations, which peer-operated homeservers must not redirect elsewhere
-    reader: PubkyTransport,
+    /// Reads conversations and clears them, which homeservers must not redirect elsewhere
+    transport: PubkyTransport,
     keypair: Keypair,
     fetch_config: FetchConfig,
     request_permits: Semaphore,
@@ -57,7 +58,7 @@ impl PrivateMessengerClient {
     pub fn with_client(keypair: Keypair, client: pubky::Client) -> Self {
         let fetch_config = FetchConfig::default();
         Self {
-            reader: PubkyTransport::new(&client),
+            transport: PubkyTransport::new(&client, keypair.clone()),
             client,
             keypair,
             request_permits: request_permits(fetch_config.max_concurrent_requests),
@@ -232,7 +233,7 @@ impl PrivateMessengerClient {
     /// Requests run concurrently within this client's [`FetchConfig`] limits.
     pub async fn fetch_messages(&self, other_pubky: &PublicKey) -> Result<MessageFetch> {
         receive_messages(
-            &self.reader,
+            &self.transport,
             &self.request_permits,
             &self.fetch_config,
             &self.keypair,
@@ -253,7 +254,7 @@ impl PrivateMessengerClient {
         state: &mut ReceiveState,
     ) -> Result<ReceivedMessages> {
         receive_new(
-            &self.reader,
+            &self.transport,
             &self.request_permits,
             &self.fetch_config,
             &self.keypair,
@@ -273,7 +274,7 @@ impl PrivateMessengerClient {
         state: &mut ReceiveState,
     ) -> Result<Discovery> {
         discover(
-            &self.reader,
+            &self.transport,
             &self.request_permits,
             &self.fetch_config,
             &self.keypair,
@@ -290,7 +291,7 @@ impl PrivateMessengerClient {
         pending: &[PendingMessage],
     ) -> Result<ReceivedMessages> {
         retrieve(
-            &self.reader,
+            &self.transport,
             &self.request_permits,
             &self.fetch_config,
             &self.keypair,
@@ -561,78 +562,18 @@ impl PrivateMessengerClient {
     }
 
     /// Clear all sent messages in a conversation with a specific pubky
+    ///
+    /// Fails if the listing could not be read, a message could not be deleted, or the
+    /// homeserver listed anything that is not a message in this conversation. Such entries are
+    /// never requested.
     pub async fn clear_messages(&self, other_pubky: &PublicKey) -> Result<()> {
-        let private_path = generate_conversation_path(&self.keypair, other_pubky)?;
-        let self_path = format!("pubky://{}{}", self.keypair.public_key(), private_path);
-
-        // List all messages in the conversation
-        let urls = match self.client.list(&self_path) {
-            Ok(list_builder) => match list_builder.send().await {
-                Ok(urls) => urls,
-                Err(_) => {
-                    // No messages to clear
-                    return Ok(());
-                }
-            },
-            Err(_) => {
-                // No messages to clear
-                return Ok(());
-            }
-        };
-
-        // If no messages, return early
-        if urls.is_empty() {
-            return Ok(());
-        }
-
-        // Delete messages in smaller batches to avoid rate limiting
-        const BATCH_SIZE: usize = 5;
-        for chunk in urls.chunks(BATCH_SIZE) {
-            // Create delete futures for this batch
-            let delete_futures: Vec<_> = chunk
-                .iter()
-                .map(|url| async move { self.client.delete(url).send().await })
-                .collect();
-
-            // Execute batch deletions in parallel
-            let results = join_all(delete_futures).await;
-
-            // Check for any failures
-            for (i, result) in results.iter().enumerate() {
-                match result {
-                    Ok(response) if !response.status().is_success() => {
-                        // Retry once on rate limiting
-                        if response.status() == 429 {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                            let retry = self.client.delete(&chunk[i]).send().await?;
-                            if !retry.status().is_success() {
-                                return Err(anyhow!(
-                                    "Failed to delete message at {} after retry: {}",
-                                    chunk[i],
-                                    retry.status()
-                                ));
-                            }
-                        } else {
-                            return Err(anyhow!(
-                                "Failed to delete message at {}: {}",
-                                chunk[i],
-                                response.status()
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Failed to delete message at {}: {}", chunk[i], e));
-                    }
-                    _ => {}
-                }
-            }
-
-            // Add a small delay between batches to avoid rate limiting
-            if chunk.len() == BATCH_SIZE {
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            }
-        }
-
-        Ok(())
+        clear_messages(
+            &self.transport,
+            &self.request_permits,
+            &self.fetch_config,
+            &self.keypair,
+            other_pubky,
+        )
+        .await
     }
 }

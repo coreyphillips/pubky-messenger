@@ -1,9 +1,11 @@
 use anyhow::Result;
 use futures::future::{join_all, BoxFuture};
 use pkarr::{Keypair, PublicKey};
+use pubky_common::auth::AuthToken;
+use pubky_common::capabilities::{Action, Capability};
 use std::fmt;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use tokio::time::error::Elapsed;
 
 use crate::crypto::ConversationKey;
@@ -138,25 +140,65 @@ pub(crate) trait Transport: Sync {
         url: &'a str,
         if_none_match: Option<&'a str>,
     ) -> BoxFuture<'a, Result<HttpResponse, String>>;
+
+    /// DELETE `url` as the signed-in identity, returning the status
+    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<u16, String>>;
 }
 
-/// Reads `pubky://` URLs the way `pubky::Client` does, but only follows redirects that stay on
-/// the origin first requested
+/// Reads and deletes `pubky://` URLs the way `pubky::Client` does, but only follows redirects
+/// that stay on the origin first requested
 ///
-/// `pubky::Client` follows any redirect, so a homeserver could send the reader to a loopback or
+/// `pubky::Client` follows any redirect, so a homeserver could send a request to a loopback or
 /// internal address, and its HTTP client cannot be reconfigured.
 pub(crate) struct PubkyTransport {
     http: reqwest::Client,
+    keypair: Keypair,
+    /// Established before the first delete. `pubky::Client` keeps its session cookie private,
+    /// so this client needs a session of its own.
+    session: OnceCell<()>,
 }
 
 impl PubkyTransport {
-    pub(crate) fn new(client: &pubky::Client) -> Self {
+    pub(crate) fn new(client: &pubky::Client, keypair: Keypair) -> Self {
         let http = reqwest::ClientBuilder::from(client.pkarr().clone())
             .redirect(same_origin_redirects())
+            .cookie_store(true)
             .build()
             // pubky::Client::build makes the same assumption about this configuration
             .expect("config expected to not error");
-        Self { http }
+        Self {
+            http,
+            keypair,
+            session: OnceCell::new(),
+        }
+    }
+
+    async fn sign_in(&self) -> Result<(), String> {
+        // Only what clearing messages needs, in case the cookie is ever sent somewhere else
+        let capability = Capability {
+            scope: "/pub/private_messages/".to_string(),
+            actions: vec![Action::Write],
+        };
+        let token = AuthToken::sign(&self.keypair, vec![capability]);
+        let url = format!("https://_pubky.{}/session", self.keypair.public_key());
+        let response = self
+            .http
+            .post(url)
+            .body(token.serialize())
+            .send()
+            .await
+            .map_err(|e| error_chain(&e))?;
+        if !response.status().is_success() {
+            return Err(format!("sign-in failed with status {}", response.status()));
+        }
+        Ok(())
+    }
+}
+
+fn https_url(url: &str) -> Result<String, String> {
+    match url.strip_prefix("pubky://") {
+        Some(location) => Ok(format!("https://_pubky.{}", location)),
+        None => Err("not a pubky:// URL".to_string()),
     }
 }
 
@@ -178,10 +220,7 @@ impl Transport for PubkyTransport {
         if_none_match: Option<&'a str>,
     ) -> BoxFuture<'a, Result<HttpResponse, String>> {
         Box::pin(async move {
-            let Some(location) = url.strip_prefix("pubky://") else {
-                return Err("not a pubky:// URL".to_string());
-            };
-            let mut request = self.http.get(format!("https://_pubky.{}", location));
+            let mut request = self.http.get(https_url(url)?);
             if let Some(etag) = if_none_match {
                 request = request.header("if-none-match", etag);
             }
@@ -211,6 +250,20 @@ impl Transport for PubkyTransport {
                 etag,
                 body,
             })
+        })
+    }
+
+    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<u16, String>> {
+        Box::pin(async move {
+            let url = https_url(url)?;
+            self.session.get_or_try_init(|| self.sign_in()).await?;
+            let response = self
+                .http
+                .delete(url)
+                .send()
+                .await
+                .map_err(|e| error_chain(&e))?;
+            Ok(response.status().as_u16())
         })
     }
 }
@@ -1089,18 +1142,37 @@ mod tests {
 
         let moved = http.get(format!("{}/moved", origin)).send().await.unwrap();
         let away = http.get(format!("{}/away", origin)).send().await.unwrap();
+        let deleted = http
+            .delete(format!("{}/moved", origin))
+            .send()
+            .await
+            .unwrap();
+        let deleted_away = http
+            .delete(format!("{}/away", origin))
+            .send()
+            .await
+            .unwrap();
 
         assert_eq!(moved.status(), 200);
-        assert_eq!(away.status(), 302);
+        assert_eq!(away.status(), 307);
+        assert_eq!(deleted.status(), 200);
+        assert_eq!(deleted_away.status(), 307);
         assert_eq!(
             *origin_requests.lock().unwrap(),
-            ["/moved", "/here", "/away"]
+            [
+                "GET /moved",
+                "GET /here",
+                "GET /away",
+                "DELETE /moved",
+                "DELETE /here",
+                "DELETE /away"
+            ]
         );
         assert!(elsewhere_requests.lock().unwrap().is_empty());
     }
 
-    /// Answers a path in `redirects` with a redirect to its location, and anything else with
-    /// 200. Returns the server's origin and the paths requested.
+    /// Answers a path in `redirects` with a redirect that keeps the method, and anything else
+    /// with 200. Returns the server's origin and the requests received.
     async fn http_server(
         redirects: HashMap<String, String>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
@@ -1114,16 +1186,18 @@ mod tests {
                 let mut buffer = vec![0; 4096];
                 let read = stream.read(&mut buffer).await.unwrap();
                 let request = String::from_utf8_lossy(&buffer[..read]);
-                let path = request.split_whitespace().nth(1).unwrap().to_string();
-                let response = match redirects.get(&path) {
+                let mut request_line = request.split_whitespace();
+                let method = request_line.next().unwrap();
+                let path = request_line.next().unwrap();
+                let response = match redirects.get(path) {
                     Some(location) => format!(
-                        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         location
                     ),
                     None => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         .to_string(),
                 };
-                seen.lock().unwrap().push(path);
+                seen.lock().unwrap().push(format!("{} {}", method, path));
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });

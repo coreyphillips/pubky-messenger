@@ -1,5 +1,6 @@
 use anyhow::Result;
-use pubky_messenger::PrivateMessengerClient;
+use pubky_messenger::{Keypair, PrivateMessengerClient, PublicKey};
+use pubky_testnet::Testnet;
 use std::fs;
 
 // Helper function to load client from pkarr file
@@ -209,6 +210,41 @@ async fn test_clear_messages() -> Result<()> {
         client2_messages_after,
         "Only messages from client2 should remain"
     );
+
+    Ok(())
+}
+
+async fn signed_up_client(
+    testnet: &Testnet,
+    homeserver: &PublicKey,
+) -> Result<PrivateMessengerClient> {
+    let keypair = Keypair::random();
+    let client = PrivateMessengerClient::with_client(keypair, testnet.client_builder().build()?);
+    client.sign_up(homeserver, None).await?;
+    Ok(client)
+}
+
+#[tokio::test]
+async fn test_clear_messages_on_testnet_deletes_only_sent_messages() -> Result<()> {
+    let testnet = Testnet::run().await?;
+    let homeserver = testnet.run_homeserver().await?.public_key();
+    let alice = signed_up_client(&testnet, &homeserver).await?;
+    let bob = signed_up_client(&testnet, &homeserver).await?;
+
+    for i in 0..7 {
+        alice
+            .send_message(&bob.public_key(), &format!("from alice {i}"))
+            .await?;
+    }
+    bob.send_message(&alice.public_key(), "from bob").await?;
+
+    alice.clear_messages(&bob.public_key()).await?;
+
+    let remaining = bob.get_messages(&alice.public_key()).await?;
+    let contents: Vec<_> = remaining.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(contents, ["from bob"]);
+    // Clearing again finds nothing to delete
+    alice.clear_messages(&bob.public_key()).await?;
 
     Ok(())
 }

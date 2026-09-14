@@ -22,7 +22,7 @@ pubky = "0.4"
 pubky-common = "0.3"
 pkarr = "3.7"
 # The version pubky 0.4 builds on, so its pkarr client converts into a reqwest builder
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["cookies"] }
 
 # Cryptography
 blake3 = "1.5"
