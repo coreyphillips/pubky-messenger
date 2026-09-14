@@ -55,6 +55,12 @@ impl ConversationKey {
             .ok_or_else(|| anyhow!("Failed to convert pubky to X25519"))?;
 
         let shared = x25519_secret.diffie_hellman(&other_x25519);
+        // A small-order key yields the all-zero secret for every sender, making the key public
+        if !shared.was_contributory() {
+            return Err(anyhow!(
+                "Public key is a weak key and cannot be used for encryption"
+            ));
+        }
         Ok(Self(*shared.as_bytes()))
     }
 
@@ -74,4 +80,54 @@ impl ConversationKey {
 /// Generate deterministic conversation path for two parties
 pub fn generate_conversation_path(keypair: &Keypair, other_pubky: &PublicKey) -> Result<String> {
     Ok(ConversationKey::derive(keypair, other_pubky)?.path())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::PrivateMessage;
+
+    /// Canonical encodings of the eight Ed25519 torsion points
+    const SMALL_ORDER_KEYS: [&str; 8] = [
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000080",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+    ];
+
+    fn small_order_keys() -> Vec<PublicKey> {
+        SMALL_ORDER_KEYS
+            .iter()
+            .map(|encoded| {
+                let bytes: [u8; 32] = hex::decode(encoded).unwrap().try_into().unwrap();
+                let point = CompressedEdwardsY(bytes).decompress().unwrap();
+                assert!(point.is_small_order(), "{encoded} is not small order");
+                PublicKey::try_from(&bytes).expect("pkarr accepts small-order keys")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn derive_rejects_small_order_keys() {
+        let sender = Keypair::random();
+        for weak in small_order_keys() {
+            assert!(
+                ConversationKey::derive(&sender, &weak).is_err(),
+                "{weak} accepted"
+            );
+            assert!(generate_conversation_path(&sender, &weak).is_err());
+        }
+    }
+
+    #[test]
+    fn message_to_small_order_key_is_not_created() {
+        let sender = Keypair::random();
+        let identity =
+            PublicKey::try_from("yryyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy").unwrap();
+        assert!(PrivateMessage::new(&sender, &identity, "public secret").is_err());
+    }
 }
