@@ -48,3 +48,37 @@ fn test_message_id_generation() {
     assert_eq!(id1.len(), 36); // UUID v4 string length
     assert_eq!(id2.len(), 36);
 }
+
+#[test]
+fn test_messages_encrypted_by_0_3_0_still_decrypt() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/conversation_v0_3_0.json")).unwrap();
+    let keypair = |name: &str| {
+        let bytes: [u8; 32] = hex::decode(fixture[name].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        Keypair::from_secret_key(&bytes)
+    };
+    let alice = keypair("alice_secret_key");
+    let bob = keypair("bob_secret_key");
+
+    for entry in fixture["messages"].as_array().unwrap() {
+        let message: PrivateMessage = serde_json::from_value(entry["message"].clone()).unwrap();
+        let author = if entry["author"] == "alice" {
+            &alice
+        } else {
+            &bob
+        };
+
+        for (reader, other) in [(&alice, &bob), (&bob, &alice)] {
+            let content = message
+                .decrypt_content(reader, &other.public_key())
+                .unwrap();
+            let sender = message.decrypt_sender(reader, &other.public_key()).unwrap();
+            assert_eq!(content, entry["content"].as_str().unwrap());
+            assert_eq!(sender, author.public_key().to_string());
+            assert!(message.verify_signature(&content, &sender).unwrap());
+        }
+    }
+}

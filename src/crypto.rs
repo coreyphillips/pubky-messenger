@@ -31,29 +31,47 @@ pub fn ed25519_secret_to_x25519(ed_secret: &[u8; 32]) -> StaticSecret {
     StaticSecret::from(x25519_secret_bytes)
 }
 
-/// Generate shared secret for encryption between two keypairs
-pub fn generate_shared_secret(keypair: &Keypair, other_pubky: &PublicKey) -> Result<String> {
-    let ed25519_secret = keypair.secret_key();
-    let x25519_secret = ed25519_secret_to_x25519(&ed25519_secret);
+/// Shared secret of a two-party conversation: the encryption key for every message in it,
+/// and the source of its storage path.
+///
+/// Derive it once per operation and let it drop with the operation, rather than caching it.
+pub struct ConversationKey([u8; 32]);
 
-    let other_pubky_bytes = other_pubky.as_bytes();
-    if other_pubky_bytes.len() != 32 {
-        return Err(anyhow!("Invalid public key length"));
+impl ConversationKey {
+    /// Derive the key both participants compute for the conversation between them
+    pub fn derive(keypair: &Keypair, other_pubky: &PublicKey) -> Result<Self> {
+        let ed25519_secret = keypair.secret_key();
+        let x25519_secret = ed25519_secret_to_x25519(&ed25519_secret);
+
+        let other_pubky_bytes = other_pubky.as_bytes();
+        if other_pubky_bytes.len() != 32 {
+            return Err(anyhow!("Invalid public key length"));
+        }
+
+        let mut other_ed_bytes = [0u8; 32];
+        other_ed_bytes.copy_from_slice(other_pubky_bytes);
+
+        let other_x25519 = ed25519_public_to_x25519(&other_ed_bytes)
+            .ok_or_else(|| anyhow!("Failed to convert pubky to X25519"))?;
+
+        let shared = x25519_secret.diffie_hellman(&other_x25519);
+        Ok(Self(*shared.as_bytes()))
     }
 
-    let mut other_ed_bytes = [0u8; 32];
-    other_ed_bytes.copy_from_slice(other_pubky_bytes);
+    /// Key for encrypting and decrypting message content and sender
+    pub fn encryption_key(&self) -> &[u8; 32] {
+        &self.0
+    }
 
-    let other_x25519 = ed25519_public_to_x25519(&other_ed_bytes)
-        .ok_or_else(|| anyhow!("Failed to convert pubky to X25519"))?;
-
-    let shared = x25519_secret.diffie_hellman(&other_x25519);
-    Ok(hex::encode(shared.as_bytes()))
+    /// Deterministic conversation directory, relative to either participant's root
+    pub fn path(&self) -> String {
+        // Existing conversations live under the hash of the hex-encoded secret
+        let path_id = blake3::hash(hex::encode(self.0).as_bytes()).to_hex();
+        format!("/pub/private_messages/{}/", path_id)
+    }
 }
 
 /// Generate deterministic conversation path for two parties
 pub fn generate_conversation_path(keypair: &Keypair, other_pubky: &PublicKey) -> Result<String> {
-    let shared_secret = generate_shared_secret(keypair, other_pubky)?;
-    let path_id = blake3::hash(shared_secret.as_bytes()).to_hex();
-    Ok(format!("/pub/private_messages/{}/", path_id))
+    Ok(ConversationKey::derive(keypair, other_pubky)?.path())
 }

@@ -38,9 +38,11 @@
 mod client;
 mod crypto;
 mod message;
+mod receive;
 
 pub use client::{FollowedUser, PrivateMessengerClient, PubkyProfile};
 pub use message::{DecryptedMessage, PrivateMessage};
+pub use receive::{FailureReason, FetchConfig, FetchFailure, MessageFetch};
 
 pub use pkarr::{Keypair, PublicKey};
 pub use bip39::Language;

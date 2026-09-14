@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::crypto::generate_shared_secret;
+use crate::crypto::ConversationKey;
 
 /// A private message with encrypted sender and content
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -21,11 +21,21 @@ pub struct PrivateMessage {
 impl PrivateMessage {
     /// Create a new encrypted message
     pub fn new(sender_keypair: &Keypair, recipient_pk: &PublicKey, content: &str) -> Result<Self> {
-        let content_bytes = content.as_bytes();
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+
+        Self::new_at(sender_keypair, recipient_pk, content, timestamp)
+    }
+
+    pub(crate) fn new_at(
+        sender_keypair: &Keypair,
+        recipient_pk: &PublicKey,
+        content: &str,
+        timestamp: u64,
+    ) -> Result<Self> {
+        let content_bytes = content.as_bytes();
 
         // Create message digest for signing
         let mut hasher = Hasher::new();
@@ -38,17 +48,12 @@ impl PrivateMessage {
         let signature = sender_keypair.sign(message_digest.as_bytes());
         let signature_bytes = signature.to_bytes().to_vec();
 
-        // Generate encryption key from shared secret
-        let shared_secret = generate_shared_secret(sender_keypair, recipient_pk)?;
-        let shared_secret_bytes = hex::decode(&shared_secret)?;
-
-        let mut encryption_key = [0u8; 32];
-        encryption_key.copy_from_slice(&shared_secret_bytes);
+        let key = ConversationKey::derive(sender_keypair, recipient_pk)?;
 
         // Encrypt content and sender
-        let encrypted_content = encrypt(content_bytes, &encryption_key);
+        let encrypted_content = encrypt(content_bytes, key.encryption_key());
         let sender_string = sender_keypair.public_key().to_string();
-        let encrypted_sender = encrypt(sender_string.as_bytes(), &encryption_key);
+        let encrypted_sender = encrypt(sender_string.as_bytes(), key.encryption_key());
 
         Ok(Self {
             timestamp,
@@ -64,14 +69,10 @@ impl PrivateMessage {
         receiver_keypair: &Keypair,
         other_participant: &PublicKey,
     ) -> Result<String> {
-        let shared_secret = generate_shared_secret(receiver_keypair, other_participant)?;
-        let shared_secret_bytes = hex::decode(&shared_secret)?;
-
-        let mut encryption_key = [0u8; 32];
-        encryption_key.copy_from_slice(&shared_secret_bytes);
-
-        let decrypted = decrypt(&self.encrypted_content, &encryption_key)?;
-        Ok(String::from_utf8(decrypted)?)
+        self.decrypt_content_with(&ConversationKey::derive(
+            receiver_keypair,
+            other_participant,
+        )?)
     }
 
     /// Decrypt the sender public key
@@ -80,13 +81,19 @@ impl PrivateMessage {
         receiver_keypair: &Keypair,
         other_participant: &PublicKey,
     ) -> Result<String> {
-        let shared_secret = generate_shared_secret(receiver_keypair, other_participant)?;
-        let shared_secret_bytes = hex::decode(&shared_secret)?;
+        self.decrypt_sender_with(&ConversationKey::derive(
+            receiver_keypair,
+            other_participant,
+        )?)
+    }
 
-        let mut encryption_key = [0u8; 32];
-        encryption_key.copy_from_slice(&shared_secret_bytes);
+    pub(crate) fn decrypt_content_with(&self, key: &ConversationKey) -> Result<String> {
+        let decrypted = decrypt(&self.encrypted_content, key.encryption_key())?;
+        Ok(String::from_utf8(decrypted)?)
+    }
 
-        let decrypted = decrypt(&self.encrypted_sender, &encryption_key)?;
+    pub(crate) fn decrypt_sender_with(&self, key: &ConversationKey) -> Result<String> {
+        let decrypted = decrypt(&self.encrypted_sender, key.encryption_key())?;
         Ok(String::from_utf8(decrypted)?)
     }
 

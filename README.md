@@ -168,6 +168,33 @@ for user in followed {
 }
 ```
 
+### Reading Messages
+
+`get_messages` returns a conversation oldest first, and fails rather than returning a partial
+history if any listing or message could not be retrieved. `fetch_messages` returns what was
+retrieved together with the failures.
+
+Requests run concurrently, bounded per conversation and across the whole client, with a
+deadline and retries for timeouts, transport errors, 429 and 5xx responses. See `FetchConfig`
+for the defaults and the exact retry policy.
+
+```rust
+use pubky_messenger::FetchConfig;
+use std::time::Duration;
+
+let client = client.with_fetch_config(FetchConfig {
+    max_concurrent_requests: 8,
+    max_concurrent_requests_per_conversation: 4,
+    request_timeout: Duration::from_secs(5),
+    ..FetchConfig::default()
+});
+
+let fetch = client.fetch_messages(&recipient).await?;
+for failure in &fetch.failures {
+    eprintln!("not retrieved: {}", failure);
+}
+```
+
 ### Managing Messages
 
 The library provides methods to delete messages from your conversations:
@@ -207,7 +234,9 @@ The main client for interacting with the Pubky messaging system.
 - `sign_up(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<Session>` - Create an account on a homeserver
 - `ensure_session(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<Session>` - Sign in, signing up first if the identity has no homeserver yet
 - `send_message(&self, recipient: &PublicKey, content: &str) -> Result<String>` - Send encrypted message
-- `get_messages(&self, other: &PublicKey) -> Result<Vec<DecryptedMessage>>` - Get conversation messages
+- `with_fetch_config(self, config: FetchConfig) -> Self` - Set concurrency limits, deadlines and retries for reading messages
+- `get_messages(&self, other: &PublicKey) -> Result<Vec<DecryptedMessage>>` - Get conversation messages, failing if any could not be retrieved
+- `fetch_messages(&self, other: &PublicKey) -> Result<MessageFetch>` - Get the conversation messages that could be retrieved, and what could not
 - `delete_message(&self, message_id: &str, other: &PublicKey) -> Result<()>` - Delete a single message
 - `delete_messages(&self, message_ids: Vec<String>, other: &PublicKey) -> Result<()>` - Delete multiple messages
 - `clear_messages(&self, other: &PublicKey) -> Result<()>` - Clear all sent messages in a conversation
@@ -220,6 +249,8 @@ The main client for interacting with the Pubky messaging system.
 ### Types
 
 - `DecryptedMessage` - A decrypted message with sender, content, timestamp, and verification status
+- `FetchConfig` - Concurrency limits, request deadline and retry policy for reading messages
+- `MessageFetch` - Retrieved messages and a `FetchFailure` for each listing or message that could not be retrieved
 - `PubkyProfile` - User profile information (name, bio, image, status)
 - `FollowedUser` - Information about a followed user
 
@@ -329,6 +360,10 @@ cargo test --test test_delete_methods -- --test-threads=1
 
 # Run with output for debugging
 cargo test -- --test-threads=1 --nocapture
+
+# Compare receive time under injected latency, and key derivation CPU cost
+cargo test --lib receive_latency_report -- --ignored --nocapture
+cargo test --release --lib key_derivation_report -- --ignored --nocapture
 ```
 
 ### Test Files with Recovery Keys
