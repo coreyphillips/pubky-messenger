@@ -11,7 +11,7 @@ use tokio::time::error::Elapsed;
 use crate::crypto::ConversationKey;
 use crate::message::{DecryptedMessage, PrivateMessage};
 
-/// Concurrency limits, deadlines and retry policy for retrieving messages
+/// Concurrency limits, deadlines and retry policy for retrieving and deleting messages
 ///
 /// Each listing or message request holds a permit from its conversation and one from the
 /// client while it is in flight. Permits are released when the attempt completes, times out,
@@ -26,9 +26,9 @@ use crate::message::{DecryptedMessage, PrivateMessage};
 /// Limits and attempts below 1 are treated as 1.
 #[derive(Debug, Clone)]
 pub struct FetchConfig {
-    /// Requests in flight across every conversation being read by this client
+    /// Read and delete requests in flight across every conversation on this client
     pub max_concurrent_requests: usize,
-    /// Requests in flight for one call that reads a conversation
+    /// Requests in flight for one call that reads or deletes messages in a conversation
     pub max_concurrent_requests_per_conversation: usize,
     /// Deadline for one attempt, from sending the request to reading the whole body
     pub request_timeout: Duration,
@@ -75,7 +75,7 @@ pub struct MessageFetch {
     pub failures: Vec<FetchFailure>,
 }
 
-/// A directory listing or message that could not be retrieved
+/// A directory listing or message request that did not complete successfully
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchFailure {
     pub url: String,
@@ -141,8 +141,8 @@ pub(crate) trait Transport: Sync {
         if_none_match: Option<&'a str>,
     ) -> BoxFuture<'a, Result<HttpResponse, String>>;
 
-    /// DELETE `url` as the signed-in identity, returning the status
-    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<u16, String>>;
+    /// DELETE `url` as the signed-in identity, including any retry delay in the response
+    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>>;
 }
 
 /// Reads and deletes `pubky://` URLs the way `pubky::Client` does, but only follows redirects
@@ -253,7 +253,7 @@ impl Transport for PubkyTransport {
         })
     }
 
-    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<u16, String>> {
+    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>> {
         Box::pin(async move {
             let url = https_url(url)?;
             self.session.get_or_try_init(|| self.sign_in()).await?;
@@ -263,7 +263,18 @@ impl Transport for PubkyTransport {
                 .send()
                 .await
                 .map_err(|e| error_chain(&e))?;
-            Ok(response.status().as_u16())
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            Ok(HttpResponse {
+                status: response.status().as_u16(),
+                retry_after,
+                etag: None,
+                body: String::new(),
+            })
         })
     }
 }
@@ -405,6 +416,12 @@ pub(crate) struct Requests<'a, T> {
     config: &'a FetchConfig,
 }
 
+#[derive(Clone, Copy)]
+enum Operation<'a> {
+    Retrieve { if_none_match: Option<&'a str> },
+    Delete,
+}
+
 impl<'a, T: Transport> Requests<'a, T> {
     pub(crate) fn new(
         transport: &'a T,
@@ -481,19 +498,34 @@ impl<'a, T: Transport> Requests<'a, T> {
         url: &str,
         if_none_match: Option<&str>,
     ) -> Result<Resource, FetchFailure> {
+        self.request(url, Operation::Retrieve { if_none_match })
+            .await
+    }
+
+    /// Delete a message, including one that was already removed by an earlier attempt
+    pub(crate) async fn delete(&self, url: &str) -> Result<(), FetchFailure> {
+        self.request(url, Operation::Delete).await.map(|_| ())
+    }
+
+    async fn request(&self, url: &str, operation: Operation<'_>) -> Result<Resource, FetchFailure> {
         let max_attempts = self.config.max_attempts.max(1);
         let mut attempts = 0;
 
         loop {
             attempts += 1;
-            let (reason, retry_after) = match self.attempt(url, if_none_match).await {
+            let (reason, retry_after) = match self.attempt(url, operation).await {
                 Ok(Ok(response)) if (200..300).contains(&response.status) => {
                     return Ok(Resource::Found {
                         body: response.body,
                         etag: response.etag,
                     })
                 }
-                Ok(Ok(response)) if response.status == 304 => return Ok(Resource::NotModified),
+                Ok(Ok(response))
+                    if response.status == 304
+                        && matches!(operation, Operation::Retrieve { .. }) =>
+                {
+                    return Ok(Resource::NotModified)
+                }
                 Ok(Ok(response)) if response.status == 404 => return Ok(Resource::Missing),
                 Ok(Ok(response)) => (FailureReason::Status(response.status), response.retry_after),
                 Ok(Err(error)) => (FailureReason::Transport(error), None),
@@ -524,7 +556,7 @@ impl<'a, T: Transport> Requests<'a, T> {
     async fn attempt(
         &self,
         url: &str,
-        if_none_match: Option<&str>,
+        operation: Operation<'_>,
     ) -> Result<Result<HttpResponse, String>, Elapsed> {
         // Always conversation before client, so a call waiting on its own limit holds no
         // capacity that other conversations could use
@@ -534,11 +566,11 @@ impl<'a, T: Transport> Requests<'a, T> {
             .await
             .expect("never closed");
         let _client = self.client_permits.acquire().await.expect("never closed");
-        tokio::time::timeout(
-            self.config.request_timeout,
-            self.transport.get(url, if_none_match),
-        )
-        .await
+        let request = match operation {
+            Operation::Retrieve { if_none_match } => self.transport.get(url, if_none_match),
+            Operation::Delete => self.transport.delete(url),
+        };
+        tokio::time::timeout(self.config.request_timeout, request).await
     }
 
     fn backoff(&self, attempts: u32) -> Duration {

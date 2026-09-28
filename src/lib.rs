@@ -44,6 +44,7 @@ mod receive;
 #[cfg(test)]
 mod test_server;
 
+pub use clear::MessageDeletion;
 pub use client::{FollowedUser, PrivateMessengerClient, PubkyProfile};
 pub use incremental::{
     ChangePolicy, Discovery, MessageId, PendingMessage, ReceiveState, ReceivedMessage,
