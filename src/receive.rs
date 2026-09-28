@@ -5,13 +5,14 @@ use pubky_common::auth::AuthToken;
 use pubky_common::capabilities::{Action, Capability};
 use std::fmt;
 use std::time::Duration;
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::error::Elapsed;
 
 use crate::crypto::ConversationKey;
 use crate::message::{DecryptedMessage, PrivateMessage};
+use crate::metrics::{RequestKind, RequestMetrics};
 
-/// Concurrency limits, deadlines and retry policy for retrieving and deleting messages
+/// Concurrency limits, deadlines and retry policy for conversation storage operations
 ///
 /// Each listing or message request holds a permit from its conversation and one from the
 /// client while it is in flight. Permits are released when the attempt completes, times out,
@@ -21,14 +22,18 @@ use crate::message::{DecryptedMessage, PrivateMessage};
 /// retried until `max_attempts` have been made. Retry `n` waits `retry_base_delay * 2^(n-1)`,
 /// capped at `max_retry_delay`. A `Retry-After` header in seconds replaces that wait, and if
 /// it asks for longer than `max_retry_delay` the request is not retried. Other statuses are
-/// not retried. A 404 means the directory or message does not exist and is not a failure.
+/// not retried. A 404 is successful for reads and deletions, but fails publication. Failed
+/// session establishment preserves its status as an authentication failure, including 404.
+/// Cleanup uses at most half the client slots (minimum one), leaving foreground capacity.
+/// Queue wait, backoff and the total operation are outside each attempt's deadline; callers
+/// may apply an overall timeout and retry a saved prepared message or cleanup batch.
 ///
 /// Limits and attempts below 1 are treated as 1.
 #[derive(Debug, Clone)]
 pub struct FetchConfig {
-    /// Read and delete requests in flight across every conversation on this client
+    /// Storage attempts in flight across every conversation on this client
     pub max_concurrent_requests: usize,
-    /// Requests in flight for one call that reads or deletes messages in a conversation
+    /// Requests in flight for one call that reads, publishes or deletes conversation messages
     pub max_concurrent_requests_per_conversation: usize,
     /// Deadline for one attempt, from sending the request to reading the whole body
     pub request_timeout: Duration,
@@ -89,6 +94,8 @@ pub struct FetchFailure {
 pub enum FailureReason {
     /// Unsuccessful HTTP status; 429 means rate limited
     Status(u16),
+    /// Authentication failed before the mutation could be confirmed.
+    Authentication(u16),
     /// No complete response within `request_timeout`
     TimedOut,
     /// The request failed before a response arrived
@@ -106,6 +113,7 @@ impl fmt::Display for FetchFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = match &self.reason {
             FailureReason::Status(status) => format!("status {}", status),
+            FailureReason::Authentication(status) => format!("authentication status {}", status),
             FailureReason::TimedOut => "timed out".to_string(),
             FailureReason::Transport(error) => error.clone(),
             FailureReason::ListingStalled => "listing did not advance".to_string(),
@@ -122,18 +130,42 @@ impl fmt::Display for FetchFailure {
     }
 }
 
-pub(crate) fn request_permits(limit: usize) -> Semaphore {
-    Semaphore::new(limit.clamp(1, Semaphore::MAX_PERMITS))
+pub(crate) struct RequestBudget {
+    total: Semaphore,
+    cleanup: Semaphore,
+}
+
+pub(crate) fn request_permits(limit: usize) -> RequestBudget {
+    let limit = limit.clamp(1, Semaphore::MAX_PERMITS);
+    RequestBudget {
+        total: Semaphore::new(limit),
+        cleanup: Semaphore::new((limit / 2).max(1)),
+    }
+}
+
+#[cfg(test)]
+impl RequestBudget {
+    pub(crate) fn available_permits(&self) -> usize {
+        self.total.available_permits()
+    }
 }
 
 pub(crate) struct HttpResponse {
     pub status: u16,
+    pub authentication_failure: bool,
     pub retry_after: Option<Duration>,
     pub etag: Option<String>,
     pub body: String,
 }
 
 pub(crate) trait Transport: Sync {
+    fn metrics(&self) -> &RequestMetrics;
+
+    fn put<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+    ) -> BoxFuture<'a, Result<HttpResponse, String>>;
     /// GET `url`, answered with 304 if its entity tag matches `if_none_match`
     fn get<'a>(
         &'a self,
@@ -153,9 +185,16 @@ pub(crate) trait Transport: Sync {
 pub(crate) struct PubkyTransport {
     http: reqwest::Client,
     keypair: Keypair,
-    /// Established before the first delete. `pubky::Client` keeps its session cookie private,
-    /// so this client needs a session of its own.
-    session: OnceCell<()>,
+    // A generation allows concurrent mutations to share one refresh after an expired cookie.
+    session: Mutex<u64>,
+    session_url: String,
+    metrics: RequestMetrics,
+}
+
+#[derive(Clone, Copy)]
+enum Mutation<'a> {
+    Put(&'a [u8]),
+    Delete,
 }
 
 impl PubkyTransport {
@@ -164,34 +203,120 @@ impl PubkyTransport {
             .redirect(same_origin_redirects())
             .cookie_store(true)
             .build()
-            // pubky::Client::build makes the same assumption about this configuration
             .expect("config expected to not error");
         Self {
             http,
+            session_url: format!("https://_pubky.{}/session", keypair.public_key()),
             keypair,
-            session: OnceCell::new(),
+            session: Mutex::new(0),
+            metrics: RequestMetrics::default(),
         }
     }
 
-    async fn sign_in(&self) -> Result<(), String> {
-        // Only what clearing messages needs, in case the cookie is ever sent somewhere else
+    async fn sign_in(&self) -> Result<HttpResponse, String> {
         let capability = Capability {
             scope: "/pub/private_messages/".to_string(),
             actions: vec![Action::Write],
         };
-        let token = AuthToken::sign(&self.keypair, vec![capability]);
-        let url = format!("https://_pubky.{}/session", self.keypair.public_key());
+        let token = AuthToken::sign(&self.keypair, vec![capability]).serialize();
+        self.metrics.sent(RequestKind::Session, token.len());
         let response = self
             .http
-            .post(url)
-            .body(token.serialize())
+            .post(&self.session_url)
+            .body(token)
             .send()
             .await
             .map_err(|e| error_chain(&e))?;
-        if !response.status().is_success() {
-            return Err(format!("sign-in failed with status {}", response.status()));
+        self.response(response, RequestKind::Session).await
+    }
+
+    async fn session(&self, expired: Option<u64>) -> Result<Result<u64, HttpResponse>, String> {
+        let mut generation = self.session.lock().await;
+        if *generation == 0 || expired == Some(*generation) {
+            let mut response = self.sign_in().await?;
+            if !(200..300).contains(&response.status) {
+                response.authentication_failure = true;
+                return Ok(Err(response));
+            }
+            *generation = generation.saturating_add(1);
         }
-        Ok(())
+        Ok(Ok(*generation))
+    }
+
+    async fn mutate(&self, url: &str, mutation: Mutation<'_>) -> Result<HttpResponse, String> {
+        self.mutate_at(&https_url(url)?, mutation).await
+    }
+
+    async fn mutate_at(&self, url: &str, mutation: Mutation<'_>) -> Result<HttpResponse, String> {
+        let generation = match self.session(None).await? {
+            Ok(generation) => generation,
+            Err(response) => return Ok(response),
+        };
+        let response = self.mutation_attempt(url, mutation).await?;
+        if response.status != 401 {
+            return Ok(response);
+        }
+        // One coordinated refresh and one repeat per attempt. A second 401 is a permanent
+        // status failure; the request policy cannot turn this into an authentication loop.
+        if let Err(response) = self.session(Some(generation)).await? {
+            return Ok(response);
+        }
+        let mut response = self.mutation_attempt(url, mutation).await?;
+        response.authentication_failure = response.status == 401;
+        Ok(response)
+    }
+
+    async fn mutation_attempt(
+        &self,
+        url: &str,
+        mutation: Mutation<'_>,
+    ) -> Result<HttpResponse, String> {
+        let (request, kind, bytes) = match mutation {
+            Mutation::Put(body) => (
+                self.http.put(url).body(body.to_vec()),
+                RequestKind::Put,
+                body.len(),
+            ),
+            Mutation::Delete => (self.http.delete(url), RequestKind::Delete, 0),
+        };
+        self.metrics.sent(kind, bytes);
+        let response = request.send().await.map_err(|e| error_chain(&e))?;
+        self.response(response, kind).await
+    }
+
+    async fn response(
+        &self,
+        response: reqwest::Response,
+        kind: RequestKind,
+    ) -> Result<HttpResponse, String> {
+        let status = response.status().as_u16();
+        let header = |name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_string())
+        };
+        let retry_after = header("retry-after")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let etag = header("etag");
+        let bytes = response.bytes().await.map_err(|e| error_chain(&e))?;
+        self.metrics.received(kind, bytes.len());
+        let body = if matches!(kind, RequestKind::List | RequestKind::Get)
+            && (200..300).contains(&status)
+        {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            String::new()
+        };
+        Ok(HttpResponse {
+            status,
+            authentication_failure: false,
+            retry_after,
+            etag,
+            body,
+        })
     }
 }
 
@@ -214,6 +339,10 @@ pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {
 }
 
 impl Transport for PubkyTransport {
+    fn metrics(&self) -> &RequestMetrics {
+        &self.metrics
+    }
+
     fn get<'a>(
         &'a self,
         url: &'a str,
@@ -224,58 +353,27 @@ impl Transport for PubkyTransport {
             if let Some(etag) = if_none_match {
                 request = request.header("if-none-match", etag);
             }
-            let response = request.send().await.map_err(|e| error_chain(&e))?;
-
-            let status = response.status();
-            let header = |name| {
-                response
-                    .headers()
-                    .get(name)
-                    .and_then(|value| value.to_str().ok())
-                    .map(|value| value.trim().to_string())
-            };
-            let retry_after = header("retry-after")
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_secs);
-            let etag = header("etag");
-            let body = if status.is_success() {
-                response.text().await.map_err(|e| error_chain(&e))?
+            let kind = if url.split('?').next().unwrap_or(url).ends_with('/') {
+                RequestKind::List
             } else {
-                String::new()
+                RequestKind::Get
             };
-
-            Ok(HttpResponse {
-                status: status.as_u16(),
-                retry_after,
-                etag,
-                body,
-            })
+            self.metrics.sent(kind, 0);
+            let response = request.send().await.map_err(|e| error_chain(&e))?;
+            self.response(response, kind).await
         })
     }
 
+    fn put<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+    ) -> BoxFuture<'a, Result<HttpResponse, String>> {
+        Box::pin(self.mutate(url, Mutation::Put(body)))
+    }
+
     fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>> {
-        Box::pin(async move {
-            let url = https_url(url)?;
-            self.session.get_or_try_init(|| self.sign_in()).await?;
-            let response = self
-                .http
-                .delete(url)
-                .send()
-                .await
-                .map_err(|e| error_chain(&e))?;
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(Duration::from_secs);
-            Ok(HttpResponse {
-                status: response.status().as_u16(),
-                retry_after,
-                etag: None,
-                body: String::new(),
-            })
-        })
+        Box::pin(self.mutate(url, Mutation::Delete))
     }
 }
 
@@ -293,7 +391,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 /// Read every message in the conversation between `keypair` and `other_pubky`
 pub(crate) async fn receive_messages<T: Transport>(
     transport: &T,
-    client_permits: &Semaphore,
+    client_permits: &RequestBudget,
     config: &FetchConfig,
     keypair: &Keypair,
     other_pubky: &PublicKey,
@@ -411,8 +509,9 @@ pub(crate) enum Resource {
 
 pub(crate) struct Requests<'a, T> {
     transport: &'a T,
-    client_permits: &'a Semaphore,
+    client_permits: &'a RequestBudget,
     conversation_permits: Semaphore,
+    cleanup: bool,
     config: &'a FetchConfig,
 }
 
@@ -420,20 +519,43 @@ pub(crate) struct Requests<'a, T> {
 enum Operation<'a> {
     Retrieve { if_none_match: Option<&'a str> },
     Delete,
+    Publish { body: &'a [u8] },
 }
 
 impl<'a, T: Transport> Requests<'a, T> {
     pub(crate) fn new(
         transport: &'a T,
-        client_permits: &'a Semaphore,
+        client_permits: &'a RequestBudget,
         config: &'a FetchConfig,
     ) -> Self {
         Self {
             transport,
             client_permits,
-            conversation_permits: request_permits(config.max_concurrent_requests_per_conversation),
+            conversation_permits: Semaphore::new(
+                config
+                    .max_concurrent_requests_per_conversation
+                    .clamp(1, Semaphore::MAX_PERMITS),
+            ),
+            cleanup: false,
             config,
         }
+    }
+
+    pub(crate) fn for_cleanup(
+        transport: &'a T,
+        client_permits: &'a RequestBudget,
+        config: &'a FetchConfig,
+    ) -> Self {
+        Self {
+            cleanup: true,
+            ..Self::new(transport, client_permits, config)
+        }
+    }
+
+    pub(crate) async fn publish(&self, url: &str, body: &[u8]) -> Result<(), FetchFailure> {
+        self.request(url, Operation::Publish { body })
+            .await
+            .map(|_| ())
     }
 
     /// Every entry of the directory at `url`, in the homeserver's order, or `None` if the
@@ -514,6 +636,10 @@ impl<'a, T: Transport> Requests<'a, T> {
         loop {
             attempts += 1;
             let (reason, retry_after) = match self.attempt(url, operation).await {
+                Ok(Ok(response)) if response.authentication_failure => (
+                    FailureReason::Authentication(response.status),
+                    response.retry_after,
+                ),
                 Ok(Ok(response)) if (200..300).contains(&response.status) => {
                     return Ok(Resource::Found {
                         body: response.body,
@@ -526,14 +652,26 @@ impl<'a, T: Transport> Requests<'a, T> {
                 {
                     return Ok(Resource::NotModified)
                 }
-                Ok(Ok(response)) if response.status == 404 => return Ok(Resource::Missing),
+                Ok(Ok(response))
+                    if response.status == 404
+                        && !matches!(operation, Operation::Publish { .. }) =>
+                {
+                    return Ok(Resource::Missing)
+                }
                 Ok(Ok(response)) => (FailureReason::Status(response.status), response.retry_after),
                 Ok(Err(error)) => (FailureReason::Transport(error), None),
-                Err(_) => (FailureReason::TimedOut, None),
+                Err(_) => {
+                    self.transport.metrics().timed_out();
+                    (FailureReason::TimedOut, None)
+                }
             };
 
             let delay = match (&reason, retry_after) {
-                (FailureReason::Status(status), _) if !is_retryable(*status) => None,
+                (FailureReason::Status(status) | FailureReason::Authentication(status), _)
+                    if !is_retryable(*status) =>
+                {
+                    None
+                }
                 (_, Some(requested)) => {
                     Some(requested).filter(|d| *d <= self.config.max_retry_delay)
                 }
@@ -541,7 +679,10 @@ impl<'a, T: Transport> Requests<'a, T> {
             };
 
             match delay {
-                Some(delay) if attempts < max_attempts => tokio::time::sleep(delay).await,
+                Some(delay) if attempts < max_attempts => {
+                    tokio::time::sleep(delay).await;
+                    self.transport.metrics().retried();
+                }
                 _ => {
                     return Err(FetchFailure {
                         url: url.to_string(),
@@ -558,17 +699,39 @@ impl<'a, T: Transport> Requests<'a, T> {
         url: &str,
         operation: Operation<'_>,
     ) -> Result<Result<HttpResponse, String>, Elapsed> {
-        // Always conversation before client, so a call waiting on its own limit holds no
-        // capacity that other conversations could use
+        let queued = AdmissionWait {
+            metrics: self.transport.metrics(),
+            since: tokio::time::Instant::now(),
+        };
+        // Cleanup takes its reservation before joining the shared FIFO queue. At most half
+        // the total slots can be held by cleanup when the client has multiple slots.
+        let _cleanup = if self.cleanup || matches!(operation, Operation::Delete) {
+            Some(
+                self.client_permits
+                    .cleanup
+                    .acquire()
+                    .await
+                    .expect("never closed"),
+            )
+        } else {
+            None
+        };
         let _conversation = self
             .conversation_permits
             .acquire()
             .await
             .expect("never closed");
-        let _client = self.client_permits.acquire().await.expect("never closed");
+        let _client = self
+            .client_permits
+            .total
+            .acquire()
+            .await
+            .expect("never closed");
+        drop(queued);
         let request = match operation {
             Operation::Retrieve { if_none_match } => self.transport.get(url, if_none_match),
             Operation::Delete => self.transport.delete(url),
+            Operation::Publish { body } => self.transport.put(url, body),
         };
         tokio::time::timeout(self.config.request_timeout, request).await
     }
@@ -581,6 +744,19 @@ impl<'a, T: Transport> Requests<'a, T> {
             .min(self.config.max_retry_delay)
     }
 }
+
+struct AdmissionWait<'a> {
+    metrics: &'a RequestMetrics,
+    since: tokio::time::Instant,
+}
+
+impl Drop for AdmissionWait<'_> {
+    fn drop(&mut self) {
+        self.metrics.queued(self.since.elapsed());
+    }
+}
+
+impl std::error::Error for FetchFailure {}
 
 fn is_retryable(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
@@ -629,7 +805,7 @@ mod tests {
 
     async fn receive(
         server: &FakeServer,
-        permits: &Semaphore,
+        permits: &RequestBudget,
         config: &FetchConfig,
         reader: &Keypair,
         other: &PublicKey,
@@ -1358,3 +1534,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;

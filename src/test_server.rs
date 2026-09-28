@@ -9,6 +9,7 @@ use tokio::time::Instant;
 
 use crate::crypto::ConversationKey;
 use crate::message::PrivateMessage;
+use crate::metrics::{RequestKind, RequestMetrics};
 use crate::receive::{HttpResponse, Transport};
 
 type AfterRequest = Box<dyn FnOnce(&FakeServer) + Send>;
@@ -23,6 +24,7 @@ pub enum Reply {
     },
     Hang,
     Broken,
+    StoredThenBroken,
 }
 
 /// Serves files and paged directory listings with injected latency, and records concurrency,
@@ -34,6 +36,8 @@ pub struct FakeServer {
     routes: Mutex<HashMap<String, Vec<Reply>>>,
     /// Scripted DELETE responses, independent of the file bodies served by GET
     delete_routes: Mutex<HashMap<String, Vec<Reply>>>,
+    put_routes: Mutex<HashMap<String, Vec<Reply>>>,
+    metrics: RequestMetrics,
     pub delays: HashMap<String, Duration>,
     pub latency: Duration,
     /// Serve the first page of every listing, whatever the cursor
@@ -60,6 +64,7 @@ pub struct ServerState {
     pub not_modified: usize,
     /// URLs removed by successful deletes, in order
     pub deleted: Vec<String>,
+    pub put_bodies: Vec<(String, Vec<u8>)>,
 }
 
 struct InFlight<'a> {
@@ -158,6 +163,13 @@ impl FakeServer {
 
     pub fn reply_delete(&self, url: &str, replies: Vec<Reply>) {
         self.delete_routes
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), replies);
+    }
+
+    pub fn reply_put(&self, url: &str, replies: Vec<Reply>) {
+        self.put_routes
             .lock()
             .unwrap()
             .insert(url.to_string(), replies);
@@ -296,6 +308,66 @@ impl FakeServer {
 }
 
 impl Transport for FakeServer {
+    fn metrics(&self) -> &RequestMetrics {
+        &self.metrics
+    }
+
+    fn put<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+    ) -> BoxFuture<'a, Result<HttpResponse, String>> {
+        Box::pin(async move {
+            let (attempt, _in_flight) = self.begin(url);
+            self.metrics.sent(RequestKind::Put, body.len());
+            self.state
+                .lock()
+                .unwrap()
+                .put_bodies
+                .push((url.to_string(), body.to_vec()));
+            tokio::time::sleep(self.delays.get(url).copied().unwrap_or(self.latency)).await;
+            let reply = self
+                .put_routes
+                .lock()
+                .unwrap()
+                .get(url)
+                .map(|replies| replies[(attempt - 1).min(replies.len() - 1)].clone())
+                .unwrap_or(Reply::Status(200));
+            let (status, retry_after, lose_reply) = match reply {
+                Reply::Status(status) => (status, None, false),
+                Reply::RateLimited { retry_after_secs } => {
+                    (429, Some(Duration::from_secs(retry_after_secs)), false)
+                }
+                Reply::Hang => return futures::future::pending().await,
+                Reply::Broken => return Err("connection reset".to_string()),
+                Reply::StoredThenBroken => (200, None, true),
+                Reply::Body(_) => panic!("a put response cannot serve a body"),
+            };
+            if (200..300).contains(&status) {
+                self.reply(
+                    url,
+                    vec![Reply::Body(String::from_utf8(body.to_vec()).unwrap())],
+                );
+                let directory = &url[..url.rfind('/').unwrap() + 1];
+                let mut entries = self.entries(directory);
+                if !entries.iter().any(|entry| entry == url) {
+                    entries.push(url.to_string());
+                }
+                self.reply(directory, vec![Reply::Body(entries.join("\n"))]);
+            }
+            if lose_reply {
+                return Err("response lost after storage".to_string());
+            }
+            Ok(HttpResponse {
+                status,
+                authentication_failure: false,
+                retry_after,
+                etag: None,
+                body: String::new(),
+            })
+        })
+    }
+
     fn get<'a>(
         &'a self,
         url: &'a str,
@@ -304,6 +376,12 @@ impl Transport for FakeServer {
         Box::pin(async move {
             let (attempt, _in_flight) = self.begin(url);
             let path = url.split('?').next().unwrap();
+            let kind = if path.ends_with('/') {
+                RequestKind::List
+            } else {
+                RequestKind::Get
+            };
+            self.metrics.sent(kind, 0);
             tokio::time::sleep(self.delays.get(path).copied().unwrap_or(self.latency)).await;
 
             let reply = self.respond(url, attempt, if_none_match);
@@ -320,12 +398,16 @@ impl Transport for FakeServer {
 
             let response = |status, retry_after, etag, body| HttpResponse {
                 status,
+                authentication_failure: false,
                 retry_after,
                 etag,
                 body,
             };
             match reply {
-                Reply::Body(body) => Ok(response(200, None, Some(etag(&body)), body)),
+                Reply::Body(body) => {
+                    self.metrics.received(kind, body.len());
+                    Ok(response(200, None, Some(etag(&body)), body))
+                }
                 Reply::Status(status) => Ok(response(status, None, None, String::new())),
                 Reply::RateLimited { retry_after_secs } => Ok(response(
                     429,
@@ -334,7 +416,7 @@ impl Transport for FakeServer {
                     String::new(),
                 )),
                 Reply::Hang => futures::future::pending().await,
-                Reply::Broken => Err("connection reset".to_string()),
+                Reply::Broken | Reply::StoredThenBroken => Err("connection reset".to_string()),
             }
         })
     }
@@ -342,6 +424,7 @@ impl Transport for FakeServer {
     fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>> {
         Box::pin(async move {
             let (attempt, _in_flight) = self.begin(url);
+            self.metrics.sent(RequestKind::Delete, 0);
             tokio::time::sleep(self.delays.get(url).copied().unwrap_or(self.latency)).await;
             let reply = self
                 .delete_routes
@@ -355,7 +438,9 @@ impl Transport for FakeServer {
                     (429, Some(Duration::from_secs(retry_after_secs)))
                 }
                 Some(Reply::Hang) => return futures::future::pending().await,
-                Some(Reply::Broken) => return Err("connection reset".to_string()),
+                Some(Reply::Broken | Reply::StoredThenBroken) => {
+                    return Err("connection reset".to_string())
+                }
                 Some(Reply::Body(_)) => panic!("a delete response cannot serve a body"),
                 None if self.routes.lock().unwrap().contains_key(url) => (200, None),
                 None => (404, None),
@@ -366,6 +451,7 @@ impl Transport for FakeServer {
             }
             Ok(HttpResponse {
                 status,
+                authentication_failure: false,
                 retry_after,
                 etag: None,
                 body: String::new(),

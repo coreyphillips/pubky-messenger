@@ -96,7 +96,39 @@ Where:
 This ensures:
 - Both parties can find messages without coordination
 - Messages remain encrypted at rest on the network
-- No metadata leakage about conversation participants
+- Conversation paths do not contain the participants' keys, although publisher identity,
+  message existence and request patterns remain visible to the storage service
+
+## Publication and Recovery
+
+`PreparedMessage` separates encryption from network I/O. Version 1 stores a canonical UUID,
+owner, recipient, exact serialized `PrivateMessage` bytes and a signature binding these fields.
+The binding hashes the domain string `pubky-messenger/prepared-message`, the one-byte version,
+then ID, owner, recipient and payload as length-prefixed byte strings. Lengths are big-endian
+u64 values. The owner signs that Blake3 digest with its Ed25519 key. This prepared envelope
+belongs in the application's durable outbox. Only its unchanged encrypted payload is published,
+so the wire message format and conversation path remain compatible with earlier messages.
+
+Publication validates the envelope, reconstructs the destination from the local identity and
+recipient, and sends a PUT with the same resource ID and bytes on every attempt. A lost response
+or process restart can cause a repeated PUT but cannot create another resource when the same
+prepared value is retried. Successful storage is not evidence of peer consumption. Application
+request IDs, outbox persistence, inbox processing and protocol acknowledgments belong to the
+caller.
+
+The request engine shares concurrency and retries across reads, publication and cleanup.
+Cleanup has a separate admission limit of half the client slots, with a minimum of one.
+This keeps capacity available for foreground work when multiple slots are configured.
+Attempt deadlines include session establishment and one coordinated refresh after expiry;
+queue wait and backoff require a caller-owned total deadline. Persistent authentication
+failure remains a typed failure. Cancellation releases permits and leaves ambiguous mutation
+outcomes retryable through their saved prepared value or selected cleanup IDs.
+
+Directory discovery still scans both participant listings in full because UUID names are not
+chronological cursors. `ReceiveState` suppresses acknowledged body downloads, with at-least-once
+delivery until the caller processes and persists its acknowledgment. Targeted cleanup removes
+only the caller's selected resources. Whole-conversation clearing is inappropriate when another
+active exchange with the peer still needs its messages.
 
 ## Message Decryption Process
 
@@ -137,6 +169,11 @@ Clients check both potential message locations:
 - `src/crypto.rs`: Key conversion and shared secret generation
 - `src/message.rs`: Message encryption/decryption and structure definitions
 - `src/client.rs`: High-level client API for sending/receiving messages
+- `src/prepared.rs`: Validated durable publication intent and stable retries
+- `src/receive.rs`: Shared admission, transport requests, authentication and retry policy
+- `src/incremental.rs`: Discovery, retrieval and serializable acknowledgment state
+- `src/clear.rs`: Selected cleanup and per-resource outcomes
+- `src/metrics.rs`: Request and body-byte counters without message contents
 
 ### Dependencies
 
@@ -168,5 +205,5 @@ for msg in messages {
 
 1. **Forward Secrecy**: Implement ephemeral key rotation (e.g., Double Ratchet)
 2. **Group Messaging**: Extend to support multi-party conversations
-3. **Message Deletion**: Add secure deletion capabilities
+3. **Retention Policy**: Applications coordinate recovery-safe cleanup; remote deletion does not erase recipient copies or storage backups
 4. **Rich Media**: Support for encrypted attachments and media

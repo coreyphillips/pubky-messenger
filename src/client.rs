@@ -4,16 +4,17 @@ use futures::future::join_all;
 use pkarr::{Keypair, PublicKey};
 use pubky_common::{recovery_file, session::Session};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
 
 use crate::clear::{clear_messages, delete_messages, MessageDeletion};
-use crate::crypto::generate_conversation_path;
 use crate::incremental::{
     discover, receive_new, retrieve, Discovery, PendingMessage, ReceiveState, ReceivedMessages,
 };
-use crate::message::{DecryptedMessage, PrivateMessage};
+use crate::message::DecryptedMessage;
+use crate::metrics::RequestStats;
+use crate::prepared::{publish, PreparedMessage};
 use crate::receive::{
-    receive_messages, request_permits, FetchConfig, MessageFetch, PubkyTransport,
+    receive_messages, request_permits, FetchConfig, MessageFetch, PubkyTransport, RequestBudget,
+    Transport,
 };
 
 /// Profile information from Pubky
@@ -39,7 +40,7 @@ pub struct PrivateMessengerClient {
     transport: PubkyTransport,
     keypair: Keypair,
     fetch_config: FetchConfig,
-    request_permits: Semaphore,
+    request_permits: RequestBudget,
 }
 
 impl PrivateMessengerClient {
@@ -66,7 +67,7 @@ impl PrivateMessengerClient {
         }
     }
 
-    /// Replace the concurrency limits, deadlines and retry policy used to read and delete messages
+    /// Replace the shared concurrency limits, deadlines and retry policy for conversation storage
     pub fn with_fetch_config(mut self, fetch_config: FetchConfig) -> Self {
         self.request_permits = request_permits(fetch_config.max_concurrent_requests);
         self.fetch_config = fetch_config;
@@ -186,27 +187,42 @@ impl PrivateMessengerClient {
         self.sign_up(homeserver, signup_token).await
     }
 
-    /// Send an encrypted message to a recipient
+    /// Prepare an encrypted message without making network requests.
+    ///
+    /// Durable callers must persist the returned value before calling [`Self::publish_message`].
+    pub fn prepare_message(&self, recipient: &PublicKey, content: &str) -> Result<PreparedMessage> {
+        PreparedMessage::prepare(&self.keypair, recipient, content)
+    }
+
+    /// Publish the prepared bytes at their stable ID, returning that ID after storage succeeds.
+    ///
+    /// Repeated publication uses identical bytes and does not create another resource. Stored
+    /// does not mean consumed or acknowledged by the peer. A restored value is validated before
+    /// any network request. Cancellation leaves the storage outcome unknown; retry the same value.
+    pub async fn publish_message(&self, prepared: &PreparedMessage) -> Result<String> {
+        publish(
+            &self.transport,
+            &self.request_permits,
+            &self.fetch_config,
+            &self.keypair,
+            prepared,
+        )
+        .await
+    }
+
+    /// Prepare and publish one encrypted message. Durable callers should use the two steps
+    /// separately: calling this convenience method again creates a new message and ID.
     pub async fn send_message(&self, recipient: &PublicKey, content: &str) -> Result<String> {
-        let message = PrivateMessage::new(&self.keypair, recipient, content)?;
-        let msg_id = PrivateMessage::generate_id();
-        let serialized = serde_json::to_string(&message)?;
+        self.publish_message(&self.prepare_message(recipient, content)?)
+            .await
+    }
 
-        let private_path = generate_conversation_path(&self.keypair, recipient)?;
-        let path = format!(
-            "pubky://{}{}{}",
-            self.keypair.public_key(),
-            private_path,
-            format!("{}.json", msg_id)
-        );
-
-        let response = self.client.put(&path).body(serialized).send().await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("Failed to store message: {}", response.status()));
-        }
-
-        Ok(msg_id)
+    /// Cumulative LIST/GET/PUT/DELETE/session attempts, body bytes, retries and admission wait.
+    ///
+    /// Covers the conversation storage transport. Profile, follow and explicit account
+    /// registration operations use the underlying Pubky client and are not included.
+    pub fn request_stats(&self) -> RequestStats {
+        self.transport.metrics().snapshot()
     }
 
     /// Get all messages in a conversation, oldest first
@@ -350,21 +366,14 @@ impl PrivateMessengerClient {
 
         let results = join_all(profile_futures).await;
 
-        let mut users = Vec::new();
-        for result in results {
-            if let Ok(user) = result {
-                users.push(user);
-            }
-        }
-
-        Ok(users)
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Get profile for a specific user
     async fn get_user_profile(&self, follow_url: &str) -> Result<FollowedUser> {
         let pubky_id = follow_url
             .split('/')
-            .last()
+            .next_back()
             .ok_or_else(|| anyhow!("Failed to extract pubky from URL"))?;
 
         let profile_url = format!("pubky://{}/pub/pubky.app/profile.json", pubky_id);
@@ -417,14 +426,7 @@ impl PrivateMessengerClient {
 
         let results = join_all(profile_futures).await;
 
-        let mut users = Vec::new();
-        for result in results {
-            if let Ok(user) = result {
-                users.push(user);
-            }
-        }
-
-        Ok(users)
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Follow a user by adding them to our follow list
@@ -447,7 +449,8 @@ impl PrivateMessengerClient {
         );
 
         // Send PUT request with follow data
-        let response = self.client
+        let response = self
+            .client
             .put(&follow_url)
             .body(follow_data.to_string())
             .send()
@@ -470,10 +473,7 @@ impl PrivateMessengerClient {
         );
 
         // Send DELETE request
-        let response = self.client
-            .delete(&follow_url)
-            .send()
-            .await?;
+        let response = self.client.delete(&follow_url).send().await?;
 
         if !response.status().is_success() {
             return Err(anyhow!("Failed to delete follow: {}", response.status()));

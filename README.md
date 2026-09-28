@@ -16,7 +16,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pubky-messenger = "0.2.1"
+pubky-messenger = "0.4.0"
 ```
 
 ## Usage
@@ -67,6 +67,64 @@ use pubky_messenger::PrivateMessengerClient;
 let keypair = Keypair::random();
 let client = PrivateMessengerClient::new(keypair)?;
 ```
+
+### Durable Sending
+
+Prepare an encrypted message before making network requests:
+
+```rust
+let prepared = client.prepare_message(&recipient, "request content")?;
+let saved = serde_json::to_vec(&prepared)?;
+```
+
+Save `saved` with the application's durable outbox transaction before publishing. After a
+restart, deserialize it into `PreparedMessage` and publish the same value:
+
+```rust
+use pubky_messenger::PreparedMessage;
+
+let prepared: PreparedMessage = serde_json::from_slice(&saved)?;
+let id = client.publish_message(&prepared).await?;
+```
+
+Every attempt sends the same encrypted bytes to the same ID. If a homeserver stores the
+message but its response is lost, retrying does not create a second message. The prepared
+format is versioned and signs the owner, recipient, ID and encrypted payload together.
+Restored values are validated before I/O. The destination is derived locally, never loaded
+as an arbitrary URL. `prepared.id()` also identifies the exact resource for later cleanup.
+
+`send_message` remains a prepare-and-publish convenience wrapper. Calling it again creates
+a fresh message. Durable callers must retain a prepared value when publication fails or is
+cancelled. The library owns neither an outbox database nor a background retry worker.
+Successful publication means stored, not consumed or acknowledged by the recipient. An
+application request ID in the content remains separate from the transport resource ID.
+
+### Request Limits and Metrics
+
+`FetchConfig` governs conversation reads, prepared publication and deletion. Attempts share
+a client budget, acquire per-call permits, release them during backoff, and stop at the
+configured deadline. Cleanup is additionally limited to half the client budget, rounded
+down with a minimum of one, so a cleanup backlog leaves foreground capacity when the client
+has at least two slots. With one slot, FIFO admission and attempt deadlines bound each turn.
+
+The deadline covers one admitted attempt, including any session establishment or refresh.
+It does not cover queue wait, retry backoff or an entire multi-page operation. Wrap the
+whole operation in `tokio::time::timeout` when it has an application deadline. Cancellation
+releases capacity, but the outcome of an interrupted PUT or DELETE is unknown. Retain the
+prepared message or cleanup IDs and retry them.
+
+Authenticated mutations establish a scoped session as needed. Concurrent requests with an
+expired session share a refresh. Each attempt refreshes at most once and repeats the
+mutation at most once. Persistent authentication rejection is reported as
+`FailureReason::Authentication(status)`; transient sign-in failures follow the configured
+retry policy. Publication errors can be downcast to `FetchFailure` for classification.
+
+`client.request_stats()` returns cumulative LIST, GET, PUT, DELETE and session attempt counts,
+body bytes, retries, timeouts and admission wait. It records no payloads, destinations or
+credentials. Body bytes count bytes offered for upload and complete response bodies read,
+including retries and errors. They exclude headers and TLS; interrupted transfers may move
+different amounts on the wire. Explicit account, profile and follow operations are outside
+these counters. Compare snapshots around a workload to measure actual storage requests.
 
 ### Creating a Client from Recovery Phrase
 
@@ -305,7 +363,10 @@ The main client for interacting with the Pubky messaging system.
 - `sign_up(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<Session>` - Create an account on a homeserver
 - `ensure_session(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<Session>` - Sign in, signing up first if the identity has no homeserver yet
 - `send_message(&self, recipient: &PublicKey, content: &str) -> Result<String>` - Send encrypted message
-- `with_fetch_config(self, config: FetchConfig) -> Self` - Set concurrency limits, deadlines and retries for reading messages
+- `prepare_message(&self, recipient: &PublicKey, content: &str) -> Result<PreparedMessage>` - Prepare a stable encrypted publication before I/O
+- `publish_message(&self, prepared: &PreparedMessage) -> Result<String>` - Publish or retry the prepared ID and exact payload
+- `request_stats(&self) -> RequestStats` - Snapshot cumulative storage request and body-byte counters
+- `with_fetch_config(self, config: FetchConfig) -> Self` - Set shared concurrency limits, deadlines and retries for reads, publication and cleanup
 - `get_messages(&self, other: &PublicKey) -> Result<Vec<DecryptedMessage>>` - Get conversation messages, failing if any could not be retrieved
 - `fetch_messages(&self, other: &PublicKey) -> Result<MessageFetch>` - Get the conversation messages that could be retrieved, and what could not
 - `receive_new_messages(&self, other: &PublicKey, state: &mut ReceiveState) -> Result<ReceivedMessages>` - Get the messages `state` has not acknowledged
@@ -328,6 +389,8 @@ The main client for interacting with the Pubky messaging system.
 - `FetchConfig` - Concurrency limits, request deadline and retry policy for reading and deleting messages
 - `MessageFetch` - Retrieved messages and a `FetchFailure` for each listing or message that could not be retrieved
 - `MessageDeletion` - Successfully deleted or already absent message URLs and a `FetchFailure` for each failed listing or deletion
+- `PreparedMessage` - Versioned, serializable and authenticated publication intent with a stable ID and exact encrypted payload
+- `RequestStats` - Per-method attempts and body bytes, retry and timeout counts, and aggregate admission wait
 - `ReceiveState` - Serializable record of acknowledged messages in one conversation, with its `ChangePolicy`
 - `ReceivedMessage` - A retrieved message with its `MessageId`, entity tag, and whether it changed since it was acknowledged
 - `PubkyProfile` - User profile information (name, bio, image, status)

@@ -3,13 +3,12 @@ use futures::future::join_all;
 use pkarr::{Keypair, PublicKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use tokio::sync::Semaphore;
 
 use crate::crypto::ConversationKey;
 use crate::message::DecryptedMessage;
 use crate::receive::{
     conversation_directories, decrypt_message, is_message_url, message_urls, outside_conversation,
-    FetchConfig, FetchFailure, Requests, Resource, Transport,
+    FetchConfig, FetchFailure, RequestBudget, Requests, Resource, Transport,
 };
 
 /// Where a message is published, known from a directory listing before its body is downloaded
@@ -153,7 +152,7 @@ pub struct ReceivedMessage {
 /// List both directories of the conversation and return what `state` has not acknowledged
 pub(crate) async fn discover<T: Transport>(
     transport: &T,
-    client_permits: &Semaphore,
+    client_permits: &RequestBudget,
     config: &FetchConfig,
     keypair: &Keypair,
     other_pubky: &PublicKey,
@@ -234,7 +233,7 @@ pub(crate) async fn discover<T: Transport>(
 /// Download and decrypt the bodies of `pending` messages
 pub(crate) async fn retrieve<T: Transport>(
     transport: &T,
-    client_permits: &Semaphore,
+    client_permits: &RequestBudget,
     config: &FetchConfig,
     keypair: &Keypair,
     other_pubky: &PublicKey,
@@ -309,7 +308,7 @@ fn publishers(
 /// Discover and retrieve in one call
 pub(crate) async fn receive_new<T: Transport>(
     transport: &T,
-    client_permits: &Semaphore,
+    client_permits: &RequestBudget,
     config: &FetchConfig,
     keypair: &Keypair,
     other_pubky: &PublicKey,
@@ -351,7 +350,7 @@ mod tests {
 
     struct Conversation {
         server: FakeServer,
-        permits: Semaphore,
+        permits: RequestBudget,
         config: FetchConfig,
         alice: Keypair,
         bob: Keypair,

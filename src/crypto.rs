@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use curve25519_dalek::edwards::CompressedEdwardsY;
-use hex;
 use pkarr::{Keypair, PublicKey};
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -77,11 +76,6 @@ impl ConversationKey {
     }
 }
 
-/// Generate deterministic conversation path for two parties
-pub fn generate_conversation_path(keypair: &Keypair, other_pubky: &PublicKey) -> Result<String> {
-    Ok(ConversationKey::derive(keypair, other_pubky)?.path())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +113,6 @@ mod tests {
                 ConversationKey::derive(&sender, &weak).is_err(),
                 "{weak} accepted"
             );
-            assert!(generate_conversation_path(&sender, &weak).is_err());
         }
     }
 
@@ -141,11 +134,15 @@ mod tests {
         let expected = fixture["conversation_path"].as_str().unwrap();
 
         assert_eq!(
-            generate_conversation_path(&alice, &bob.public_key()).unwrap(),
+            ConversationKey::derive(&alice, &bob.public_key())
+                .unwrap()
+                .path(),
             expected
         );
         assert_eq!(
-            generate_conversation_path(&bob, &alice.public_key()).unwrap(),
+            ConversationKey::derive(&bob, &alice.public_key())
+                .unwrap()
+                .path(),
             expected
         );
     }
