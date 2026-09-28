@@ -40,6 +40,8 @@ mod client;
 mod crypto;
 mod incremental;
 mod message;
+mod metrics;
+mod prepared;
 mod receive;
 #[cfg(test)]
 mod test_server;
@@ -51,10 +53,12 @@ pub use incremental::{
     ReceivedMessages,
 };
 pub use message::{DecryptedMessage, PrivateMessage};
+pub use metrics::{RequestCounts, RequestStats};
+pub use prepared::PreparedMessage;
 pub use receive::{FailureReason, FetchConfig, FetchFailure, MessageFetch};
 
-pub use pkarr::{Keypair, PublicKey};
 pub use bip39::Language;
+pub use pkarr::{Keypair, PublicKey};
 
 /// The pubky crate this library is built against, for configuring a client to pass to
 /// [`PrivateMessengerClient::with_client`] without a version mismatch.

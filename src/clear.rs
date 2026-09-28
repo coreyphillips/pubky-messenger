@@ -2,12 +2,11 @@ use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use pkarr::{Keypair, PublicKey};
 use std::collections::HashSet;
-use tokio::sync::Semaphore;
 
 use crate::crypto::ConversationKey;
 use crate::receive::{
-    conversation_directories, is_message_url, message_urls, FetchConfig, FetchFailure, Requests,
-    Transport,
+    conversation_directories, is_message_url, message_urls, FetchConfig, FetchFailure,
+    RequestBudget, Requests, Transport,
 };
 
 /// Results of deleting selected messages or clearing the sender's conversation directory
@@ -35,7 +34,7 @@ impl MessageDeletion {
 /// Delete only the messages selected by the caller, validating every ID before making requests
 pub(crate) async fn delete_messages<T: Transport>(
     transport: &T,
-    client_permits: &Semaphore,
+    client_permits: &RequestBudget,
     config: &FetchConfig,
     keypair: &Keypair,
     other_pubky: &PublicKey,
@@ -51,20 +50,20 @@ pub(crate) async fn delete_messages<T: Transport>(
             Ok(format!("{}{}.json", directory, id))
         })
         .collect::<Result<Vec<_>>>()?;
-    let requests = Requests::new(transport, client_permits, config);
+    let requests = Requests::for_cleanup(transport, client_permits, config);
     Ok(delete_urls(&requests, urls).await)
 }
 
 /// Delete every message the sender has stored in this conversation
 pub(crate) async fn clear_messages<T: Transport>(
     transport: &T,
-    client_permits: &Semaphore,
+    client_permits: &RequestBudget,
     config: &FetchConfig,
     keypair: &Keypair,
     other_pubky: &PublicKey,
 ) -> Result<MessageDeletion> {
     let directory = sent_directory(keypair, other_pubky)?;
-    let requests = Requests::new(transport, client_permits, config);
+    let requests = Requests::for_cleanup(transport, client_permits, config);
     let entries = match requests.list(&directory).await {
         Ok(entries) => entries.unwrap_or_default(),
         Err(failure) => {
