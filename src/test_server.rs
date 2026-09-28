@@ -32,6 +32,8 @@ pub struct FakeServer {
     /// Replies per URL without its query, one per attempt, the last one repeating. Unknown URLs
     /// are 404.
     routes: Mutex<HashMap<String, Vec<Reply>>>,
+    /// Scripted DELETE responses, independent of the file bodies served by GET
+    delete_routes: Mutex<HashMap<String, Vec<Reply>>>,
     pub delays: HashMap<String, Duration>,
     pub latency: Duration,
     /// Serve the first page of every listing, whatever the cursor
@@ -152,6 +154,13 @@ impl FakeServer {
 
     pub fn reply(&self, url: &str, replies: Vec<Reply>) {
         self.routes.lock().unwrap().insert(url.to_string(), replies);
+    }
+
+    pub fn reply_delete(&self, url: &str, replies: Vec<Reply>) {
+        self.delete_routes
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), replies);
     }
 
     /// First reply body served at `url`
@@ -330,17 +339,37 @@ impl Transport for FakeServer {
         })
     }
 
-    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<u16, String>> {
+    fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>> {
         Box::pin(async move {
-            let (_, _in_flight) = self.begin(url);
-            tokio::time::sleep(self.latency).await;
-
-            if !self.routes.lock().unwrap().contains_key(url) {
-                return Ok(404);
+            let (attempt, _in_flight) = self.begin(url);
+            tokio::time::sleep(self.delays.get(url).copied().unwrap_or(self.latency)).await;
+            let reply = self
+                .delete_routes
+                .lock()
+                .unwrap()
+                .get(url)
+                .map(|replies| replies[(attempt - 1).min(replies.len() - 1)].clone());
+            let (status, retry_after) = match reply {
+                Some(Reply::Status(status)) => (status, None),
+                Some(Reply::RateLimited { retry_after_secs }) => {
+                    (429, Some(Duration::from_secs(retry_after_secs)))
+                }
+                Some(Reply::Hang) => return futures::future::pending().await,
+                Some(Reply::Broken) => return Err("connection reset".to_string()),
+                Some(Reply::Body(_)) => panic!("a delete response cannot serve a body"),
+                None if self.routes.lock().unwrap().contains_key(url) => (200, None),
+                None => (404, None),
+            };
+            if (200..300).contains(&status) {
+                self.remove(url);
+                self.state.lock().unwrap().deleted.push(url.to_string());
             }
-            self.remove(url);
-            self.state.lock().unwrap().deleted.push(url.to_string());
-            Ok(200)
+            Ok(HttpResponse {
+                status,
+                retry_after,
+                etag: None,
+                body: String::new(),
+            })
         })
     }
 }

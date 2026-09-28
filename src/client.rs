@@ -6,7 +6,7 @@ use pubky_common::{recovery_file, session::Session};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use crate::clear::clear_messages;
+use crate::clear::{clear_messages, delete_messages, MessageDeletion};
 use crate::crypto::generate_conversation_path;
 use crate::incremental::{
     discover, receive_new, retrieve, Discovery, PendingMessage, ReceiveState, ReceivedMessages,
@@ -66,7 +66,7 @@ impl PrivateMessengerClient {
         }
     }
 
-    /// Replace the concurrency limits, deadlines and retry policy used to read messages
+    /// Replace the concurrency limits, deadlines and retry policy used to read and delete messages
     pub fn with_fetch_config(mut self, fetch_config: FetchConfig) -> Self {
         self.request_permits = request_permits(fetch_config.max_concurrent_requests);
         self.fetch_config = fetch_config;
@@ -497,76 +497,75 @@ impl PrivateMessengerClient {
         &self.keypair
     }
 
-    /// Delete a single message by its ID from a conversation
+    /// Delete a sent message by its ID, succeeding if it is already absent
+    ///
+    /// Uses the concurrency limits, deadlines and retry policy from [`FetchConfig`].
     pub async fn delete_message(&self, message_id: &str, other_pubky: &PublicKey) -> Result<()> {
-        let private_path = generate_conversation_path(&self.keypair, other_pubky)?;
-        let url = format!(
-            "pubky://{}{}{}",
-            self.keypair.public_key(),
-            private_path,
-            format!("{}.json", message_id)
-        );
-
-        let response = self.client.delete(&url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("Failed to delete message: {}", response.status()));
-        }
-
-        Ok(())
+        self.delete_messages_with_report(&[message_id.to_string()], other_pubky)
+            .await?
+            .into_result()
     }
 
-    /// Delete multiple messages by their IDs from a conversation
+    /// Delete selected sent messages, succeeding if they are already absent
+    ///
+    /// Every ID is validated before requests begin. All selected messages are attempted even
+    /// if another deletion fails. Use [`Self::delete_messages_with_report`] for each outcome.
     pub async fn delete_messages(
         &self,
         message_ids: Vec<String>,
         other_pubky: &PublicKey,
     ) -> Result<()> {
-        let private_path = generate_conversation_path(&self.keypair, other_pubky)?;
-
-        // Create delete futures for all messages
-        let delete_futures: Vec<_> = message_ids
-            .iter()
-            .map(|msg_id| {
-                let url = format!(
-                    "pubky://{}{}{}",
-                    self.keypair.public_key(),
-                    private_path,
-                    format!("{}.json", msg_id)
-                );
-                async move { self.client.delete(&url).send().await }
-            })
-            .collect();
-
-        // Execute all deletions in parallel
-        let results = join_all(delete_futures).await;
-
-        // Check for any failures
-        for (i, result) in results.iter().enumerate() {
-            match result {
-                Ok(response) if !response.status().is_success() => {
-                    return Err(anyhow!(
-                        "Failed to delete message {}: {}",
-                        message_ids[i],
-                        response.status()
-                    ));
-                }
-                Err(e) => {
-                    return Err(anyhow!("Failed to delete message {}: {}", message_ids[i], e));
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
+        self.delete_messages_with_report(&message_ids, other_pubky)
+            .await?
+            .into_result()
     }
 
-    /// Clear all sent messages in a conversation with a specific pubky
+    /// Delete selected sent messages and report every outcome
     ///
-    /// Fails if the listing could not be read, a message could not be deleted, or the
-    /// homeserver listed anything that is not a message in this conversation. Such entries are
-    /// never requested.
+    /// IDs are the file names returned by [`Self::send_message`], without `.json`. An ID must
+    /// be nonempty, consist only of ASCII letters, digits, `-`, `.`, `_` or `~`, and cannot be
+    /// `.` or `..`. Invalid input fails before any request. Duplicate IDs are requested once.
+    ///
+    /// Only this client's files are removed. Requests share the [`FetchConfig`] concurrency
+    /// budget with reads, and use its deadlines and retries. A 404 counts as success, so a
+    /// persisted cleanup job can safely retry after an interrupted or partially failed call.
+    /// The report's `deleted` entries are full message URLs, not IDs.
+    pub async fn delete_messages_with_report(
+        &self,
+        message_ids: &[String],
+        other_pubky: &PublicKey,
+    ) -> Result<MessageDeletion> {
+        delete_messages(
+            &self.transport,
+            &self.request_permits,
+            &self.fetch_config,
+            &self.keypair,
+            other_pubky,
+            message_ids,
+        )
+        .await
+    }
+
+    /// Clear all sent messages in a conversation
+    ///
+    /// Fails if any listing or deletion fails. Entries outside the sender's conversation
+    /// directory are never requested. Use [`Self::clear_messages_with_report`] for each outcome.
     pub async fn clear_messages(&self, other_pubky: &PublicKey) -> Result<()> {
+        self.clear_messages_with_report(other_pubky)
+            .await?
+            .into_result()
+    }
+
+    /// Clear the sender's conversation directory and report each deletion or failure
+    ///
+    /// Lists the full directory before deleting anything. A failed listing leaves all files
+    /// untouched. Messages published after listing may remain. This removes every listed
+    /// sent message, so prefer [`Self::delete_messages_with_report`] when the conversation
+    /// contains multiple active exchanges. The recipient's storage is never modified.
+    pub async fn clear_messages_with_report(
+        &self,
+        other_pubky: &PublicKey,
+    ) -> Result<MessageDeletion> {
         clear_messages(
             &self.transport,
             &self.request_permits,

@@ -262,6 +262,33 @@ client.clear_messages(&recipient).await?;
 
 **Note:** These delete operations only remove messages from your own storage on the Pubky network. Messages stored by the recipient remain unchanged.
 
+Deletions use the same `FetchConfig` concurrency budget, attempt deadline and retry policy as
+reads. An already absent message (404) counts as success. Duplicate IDs are deleted once,
+and every supplied ID is validated before any request begins.
+
+For durable cleanup jobs, retain the IDs returned by `send_message` and delete only the
+messages belonging to the completed exchange. Clearing a whole conversation also removes
+messages for any other active exchange with that peer. Both participants must clean up their
+own sent messages, after the application has safely recorded the outcome and no longer needs
+the messages for recovery.
+
+Use the report methods to inspect partial failures without losing successful outcomes:
+
+```rust
+let report = client.delete_messages_with_report(&message_ids, &recipient).await?;
+for failure in &report.failures {
+    eprintln!("cleanup pending: {}", failure);
+}
+// report.deleted contains full URLs successfully removed or already absent.
+// Retrying the same IDs is safe, including after a crash or timeout.
+```
+
+`clear_messages_with_report` provides the same report for a complete conversation listing.
+It deletes nothing if listing fails, and reports entries outside the sender's conversation
+without requesting them. Messages published after listing may remain. The existing
+`delete_message`, `delete_messages` and `clear_messages` methods return an error if any
+operation fails, after attempting all valid selected messages.
+
 ## API Reference
 
 ### `PrivateMessengerClient`
@@ -286,7 +313,9 @@ The main client for interacting with the Pubky messaging system.
 - `retrieve_messages(&self, other: &PublicKey, pending: &[PendingMessage]) -> Result<ReceivedMessages>` - Download and decrypt discovered messages
 - `delete_message(&self, message_id: &str, other: &PublicKey) -> Result<()>` - Delete a single message
 - `delete_messages(&self, message_ids: Vec<String>, other: &PublicKey) -> Result<()>` - Delete multiple messages
+- `delete_messages_with_report(&self, message_ids: &[String], other: &PublicKey) -> Result<MessageDeletion>` - Delete selected messages and report successful URLs and failures
 - `clear_messages(&self, other: &PublicKey) -> Result<()>` - Clear all sent messages in a conversation
+- `clear_messages_with_report(&self, other: &PublicKey) -> Result<MessageDeletion>` - Clear sent messages and report successful URLs and failures
 - `get_own_profile(&self) -> Result<Option<PubkyProfile>>` - Get user's profile
 - `get_followed_users(&self) -> Result<Vec<FollowedUser>>` - Get followed users
 - `public_key(&self) -> PublicKey` - Get the client's public key
@@ -296,8 +325,9 @@ The main client for interacting with the Pubky messaging system.
 ### Types
 
 - `DecryptedMessage` - A decrypted message with sender, content, timestamp, and verification status
-- `FetchConfig` - Concurrency limits, request deadline and retry policy for reading messages
+- `FetchConfig` - Concurrency limits, request deadline and retry policy for reading and deleting messages
 - `MessageFetch` - Retrieved messages and a `FetchFailure` for each listing or message that could not be retrieved
+- `MessageDeletion` - Successfully deleted or already absent message URLs and a `FetchFailure` for each failed listing or deletion
 - `ReceiveState` - Serializable record of acknowledged messages in one conversation, with its `ChangePolicy`
 - `ReceivedMessage` - A retrieved message with its `MessageId`, entity tag, and whether it changed since it was acknowledged
 - `PubkyProfile` - User profile information (name, bio, image, status)

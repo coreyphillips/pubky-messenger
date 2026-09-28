@@ -250,6 +250,54 @@ async fn test_clear_messages_on_testnet_deletes_only_sent_messages() -> Result<(
 }
 
 #[tokio::test]
+async fn test_targeted_cleanup_on_testnet_preserves_other_exchanges() -> Result<()> {
+    let testnet = Testnet::run().await?;
+    let homeserver = testnet.run_homeserver().await?.public_key();
+    let alice = signed_up_client(&testnet, &homeserver).await?;
+    let bob = signed_up_client(&testnet, &homeserver).await?;
+    let finished = alice
+        .send_message(&bob.public_key(), "finished exchange")
+        .await?;
+    let active = alice
+        .send_message(&bob.public_key(), "active exchange")
+        .await?;
+    bob.send_message(&alice.public_key(), "peer message")
+        .await?;
+
+    let selected = [
+        finished.clone(),
+        "already-absent".to_string(),
+        finished.clone(),
+    ];
+    let report = alice
+        .delete_messages_with_report(&selected, &bob.public_key())
+        .await?;
+    assert!(report.failures.is_empty());
+    assert_eq!(report.deleted.len(), 2);
+    assert!(report.deleted[0].ends_with(&format!("/{finished}.json")));
+    alice.delete_message(&finished, &bob.public_key()).await?;
+
+    let remaining = bob.get_messages(&alice.public_key()).await?;
+    let mut contents: Vec<_> = remaining
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    contents.sort();
+    assert_eq!(contents, ["active exchange", "peer message"]);
+
+    alice
+        .delete_messages(vec![active], &bob.public_key())
+        .await?;
+    let report = alice.clear_messages_with_report(&bob.public_key()).await?;
+    assert!(report.deleted.is_empty());
+    assert!(report.failures.is_empty());
+    let remaining = bob.get_messages(&alice.public_key()).await?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].content, "peer message");
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_delete_non_existent_message() -> Result<()> {
     // Load client
     let client1 = load_client("p1.pkarr", "password").await?;
