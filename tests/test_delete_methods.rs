@@ -1,21 +1,24 @@
+mod common;
+
 use anyhow::Result;
 use pubky_messenger::{Keypair, PrivateMessengerClient, PublicKey};
 use pubky_testnet::Testnet;
-use std::fs;
 
-// Helper function to load client from pkarr file
-async fn load_client(pkarr_file: &str, password: &str) -> Result<PrivateMessengerClient> {
-    let recovery_file_bytes = fs::read(pkarr_file)?;
-    let client = PrivateMessengerClient::from_recovery_file(&recovery_file_bytes, Some(password))?;
-    client.sign_in().await?;
-    Ok(client)
+/// Two clients signed up on a homeserver of a local testnet, which the returned testnet keeps
+/// running. These tests used to load `p1.pkarr` and `p2.pkarr` and write to the live network,
+/// where they also raced each other over the same conversation.
+async fn pair() -> Result<(Testnet, PrivateMessengerClient, PrivateMessengerClient)> {
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
+    let first = signed_up_client(&testnet, &homeserver).await?;
+    let second = signed_up_client(&testnet, &homeserver).await?;
+    Ok((testnet, first, second))
 }
 
 #[tokio::test]
 async fn test_delete_message() -> Result<()> {
     // Load both clients
-    let client1 = load_client("p1.pkarr", "password").await?;
-    let client2 = load_client("p2.pkarr", "password").await?;
+    let (_testnet, client1, client2) = pair().await?;
 
     let client2_pubky = client2.public_key();
 
@@ -28,7 +31,9 @@ async fn test_delete_message() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
     let message_content = format!("Test message to be deleted [{}]", timestamp);
-    let message_id = client1.send_message(&client2_pubky, &message_content).await?;
+    let message_id = client1
+        .send_message(&client2_pubky, &message_content)
+        .await?;
 
     // Wait a moment for the message to be stored
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -45,7 +50,10 @@ async fn test_delete_message() -> Result<()> {
     let our_message_exists = messages_before
         .iter()
         .any(|msg| msg.content == message_content);
-    assert!(our_message_exists, "Our message should exist before deletion");
+    assert!(
+        our_message_exists,
+        "Our message should exist before deletion"
+    );
 
     // Delete the specific message
     client1.delete_message(&message_id, &client2_pubky).await?;
@@ -76,8 +84,7 @@ async fn test_delete_message() -> Result<()> {
 #[tokio::test]
 async fn test_delete_messages() -> Result<()> {
     // Load both clients
-    let client1 = load_client("p1.pkarr", "password").await?;
-    let client2 = load_client("p2.pkarr", "password").await?;
+    let (_testnet, client1, client2) = pair().await?;
 
     let client2_pubky = client2.public_key();
 
@@ -117,7 +124,9 @@ async fn test_delete_messages() -> Result<()> {
     );
 
     // Delete multiple messages
-    client1.delete_messages(message_ids.clone(), &client2_pubky).await?;
+    client1
+        .delete_messages(message_ids.clone(), &client2_pubky)
+        .await?;
 
     // Wait for deletions to be processed
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -131,9 +140,7 @@ async fn test_delete_messages() -> Result<()> {
     );
 
     // Verify the message we kept is still there
-    let kept_message_exists = messages_after
-        .iter()
-        .any(|msg| msg.content == keep_msg);
+    let kept_message_exists = messages_after.iter().any(|msg| msg.content == keep_msg);
     assert!(
         kept_message_exists,
         "Message that wasn't deleted should still exist"
@@ -145,7 +152,11 @@ async fn test_delete_messages() -> Result<()> {
         let exists = messages_after
             .iter()
             .any(|msg| msg.content == *deleted_content);
-        assert!(!exists, "Deleted message '{}' should not exist", deleted_content);
+        assert!(
+            !exists,
+            "Deleted message '{}' should not exist",
+            deleted_content
+        );
     }
 
     Ok(())
@@ -154,20 +165,23 @@ async fn test_delete_messages() -> Result<()> {
 #[tokio::test]
 async fn test_clear_messages() -> Result<()> {
     // Load both clients
-    let client1 = load_client("p1.pkarr", "password").await?;
-    let client2 = load_client("p2.pkarr", "password").await?;
+    let (_testnet, client1, client2) = pair().await?;
 
     let client2_pubky = client2.public_key();
     let client1_pubky = client1.public_key();
 
     // Send several test messages from client1 to client2
     for i in 1..=5 {
-        client1.send_message(&client2_pubky, &format!("Message {} from client1", i)).await?;
+        client1
+            .send_message(&client2_pubky, &format!("Message {} from client1", i))
+            .await?;
     }
 
     // Send messages from client2 to client1 (these should NOT be deleted)
     for i in 1..=3 {
-        client2.send_message(&client1_pubky, &format!("Message {} from client2", i)).await?;
+        client2
+            .send_message(&client1_pubky, &format!("Message {} from client2", i))
+            .await?;
     }
 
     // Get all messages before clearing
@@ -180,7 +194,10 @@ async fn test_clear_messages() -> Result<()> {
         .iter()
         .filter(|msg| msg.sender == client1.public_key_string())
         .count();
-    assert!(client1_messages_count >= 5, "Should have at least 5 messages from client1");
+    assert!(
+        client1_messages_count >= 5,
+        "Should have at least 5 messages from client1"
+    );
 
     // Clear all messages sent by client1 in the conversation
     client1.clear_messages(&client2_pubky).await?;
@@ -226,8 +243,8 @@ async fn signed_up_client(
 
 #[tokio::test]
 async fn test_clear_messages_on_testnet_deletes_only_sent_messages() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?.public_key();
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let alice = signed_up_client(&testnet, &homeserver).await?;
     let bob = signed_up_client(&testnet, &homeserver).await?;
 
@@ -251,8 +268,8 @@ async fn test_clear_messages_on_testnet_deletes_only_sent_messages() -> Result<(
 
 #[tokio::test]
 async fn test_targeted_cleanup_on_testnet_preserves_other_exchanges() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?.public_key();
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let alice = signed_up_client(&testnet, &homeserver).await?;
     let bob = signed_up_client(&testnet, &homeserver).await?;
     let finished = alice
@@ -300,27 +317,20 @@ async fn test_targeted_cleanup_on_testnet_preserves_other_exchanges() -> Result<
 #[tokio::test]
 async fn test_delete_non_existent_message() -> Result<()> {
     // Load client
-    let client1 = load_client("p1.pkarr", "password").await?;
-    let client2 = load_client("p2.pkarr", "password").await?;
+    let (_testnet, client1, client2) = pair().await?;
 
     let client2_pubky = client2.public_key();
 
     // Try to delete a non-existent message (should not panic, might return error or succeed silently)
     let fake_message_id = "00000000-0000-0000-0000-000000000000";
-    let result = client1.delete_message(fake_message_id, &client2_pubky).await;
+    let result = client1
+        .delete_message(fake_message_id, &client2_pubky)
+        .await;
 
     // The operation should complete without panicking
     // It may succeed (no-op) or return an error, both are acceptable
-    match result {
-        Ok(_) => {
-            // Silent success is acceptable for non-existent resources
-            assert!(true, "Delete of non-existent message succeeded silently");
-        }
-        Err(e) => {
-            // Error is also acceptable
-            println!("Expected error for non-existent message: {}", e);
-            assert!(true, "Delete of non-existent message returned error as expected");
-        }
+    if let Err(e) = result {
+        println!("Expected error for non-existent message: {}", e);
     }
 
     Ok(())
@@ -329,7 +339,7 @@ async fn test_delete_non_existent_message() -> Result<()> {
 #[tokio::test]
 async fn test_clear_empty_conversation() -> Result<()> {
     // Load clients
-    let client1 = load_client("p1.pkarr", "password").await?;
+    let (_testnet, client1, _client2) = pair().await?;
 
     // Create a random keypair for a conversation that definitely has no messages
     let random_keypair = pkarr::Keypair::random();
@@ -349,8 +359,7 @@ async fn test_clear_empty_conversation() -> Result<()> {
 #[tokio::test]
 async fn test_delete_messages_with_empty_list() -> Result<()> {
     // Load client
-    let client1 = load_client("p1.pkarr", "password").await?;
-    let client2 = load_client("p2.pkarr", "password").await?;
+    let (_testnet, client1, client2) = pair().await?;
 
     let client2_pubky = client2.public_key();
 
@@ -369,13 +378,14 @@ async fn test_delete_messages_with_empty_list() -> Result<()> {
 #[tokio::test]
 async fn test_delete_mixed_valid_invalid_ids() -> Result<()> {
     // Load both clients
-    let client1 = load_client("p1.pkarr", "password").await?;
-    let client2 = load_client("p2.pkarr", "password").await?;
+    let (_testnet, client1, client2) = pair().await?;
 
     let client2_pubky = client2.public_key();
 
     // Send a real message
-    let valid_id = client1.send_message(&client2_pubky, "Valid message").await?;
+    let valid_id = client1
+        .send_message(&client2_pubky, "Valid message")
+        .await?;
 
     // Mix valid and invalid IDs
     let mixed_ids = vec![

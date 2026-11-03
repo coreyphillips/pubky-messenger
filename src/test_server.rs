@@ -300,7 +300,7 @@ impl FakeServer {
         entries.sort();
         let page: Vec<&str> = entries
             .into_iter()
-            .filter(|entry| cursor.as_deref().map_or(true, |c| *entry > c))
+            .filter(|entry| cursor.as_deref().is_none_or(|c| *entry > c))
             .take(limit)
             .collect();
         Reply::Body(page.join("\n"))

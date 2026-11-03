@@ -1,3 +1,5 @@
+mod common;
+
 use anyhow::Result;
 use pubky_messenger::{FailureReason, FetchConfig, Keypair, PrivateMessengerClient, PublicKey};
 use pubky_testnet::Testnet;
@@ -15,8 +17,8 @@ async fn signed_up_client(
 
 #[tokio::test]
 async fn test_both_participants_read_the_whole_conversation_in_order() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?.public_key();
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let alice = signed_up_client(&testnet, &homeserver).await?;
     let bob = signed_up_client(&testnet, &homeserver).await?;
 
@@ -65,8 +67,8 @@ async fn test_both_participants_read_the_whole_conversation_in_order() -> Result
 
 #[tokio::test]
 async fn test_unreachable_participant_is_an_error_not_an_empty_conversation() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?.public_key();
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let alice = signed_up_client(&testnet, &homeserver)
         .await?
         .with_fetch_config(FetchConfig {

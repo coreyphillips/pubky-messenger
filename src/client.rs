@@ -2,8 +2,10 @@ use anyhow::{anyhow, Result};
 use bip39::{Language, Mnemonic};
 use futures::future::join_all;
 use pkarr::{Keypair, PublicKey};
-use pubky_common::{recovery_file, session::Session};
+use pubky::{ClientId, IntoPubkyResource, Pubky, PubkyHttpClient, PubkySession, SessionInfo};
+use pubky_common::recovery_file;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::clear::{clear_messages, delete_messages, MessageDeletion};
 use crate::incremental::{
@@ -33,9 +35,14 @@ pub struct FollowedUser {
     pub pubky: String,
 }
 
+/// Names this library to homeservers, which record the client holding each session grant
+const CLIENT_ID: &str = "pubky-messenger";
+
 /// Main client for private messaging
 pub struct PrivateMessengerClient {
-    client: pubky::Client,
+    client: PubkyHttpClient,
+    /// Session from the last sign-in or sign-up, for profile and follow writes
+    session: Mutex<Option<PubkySession>>,
     /// Reads conversations and clears them, which homeservers must not redirect elsewhere
     transport: PubkyTransport,
     keypair: Keypair,
@@ -46,9 +53,8 @@ pub struct PrivateMessengerClient {
 impl PrivateMessengerClient {
     /// Create a new client from a keypair, using a default mainnet pubky client
     pub fn new(keypair: Keypair) -> Result<Self> {
-        let client = pubky::Client::builder()
-            .build()
-            .map_err(|e| anyhow!("Failed to create pubky client: {}", e))?;
+        let client =
+            PubkyHttpClient::new().map_err(|e| anyhow!("Failed to create pubky client: {}", e))?;
 
         Ok(Self::with_client(keypair, client))
     }
@@ -56,11 +62,12 @@ impl PrivateMessengerClient {
     /// Create a new client from a keypair and an already configured pubky client
     ///
     /// Use this to reach a testnet, custom pkarr relays, or non-default timeouts.
-    pub fn with_client(keypair: Keypair, client: pubky::Client) -> Self {
+    pub fn with_client(keypair: Keypair, client: PubkyHttpClient) -> Self {
         let fetch_config = FetchConfig::default();
         Self {
             transport: PubkyTransport::new(&client, keypair.clone()),
             client,
+            session: Mutex::new(None),
             keypair,
             request_permits: request_permits(fetch_config.max_concurrent_requests),
             fetch_config,
@@ -89,7 +96,7 @@ impl PrivateMessengerClient {
         let keypair = recovery_file::decrypt_recovery_file(recovery_file_bytes, pass)
             .map_err(|e| anyhow!("Failed to decrypt recovery file: {:?}", e))?;
 
-        Self::new(keypair)
+        Self::new(keypair.into())
     }
 
     /// Create a new client from a 12-word mnemonic recovery phrase
@@ -127,12 +134,56 @@ impl PrivateMessengerClient {
         Self::new(keypair)
     }
 
+    fn pubky(&self) -> Pubky {
+        Pubky::with_client(self.client.clone())
+    }
+
+    fn signer(&self) -> pubky::PubkySigner {
+        self.pubky().signer(self.keypair.clone().into())
+    }
+
     /// Sign in to Pubky
-    pub async fn sign_in(&self) -> Result<Session> {
-        self.client
-            .signin(&self.keypair)
-            .await
-            .map_err(|e| anyhow!("Failed to sign in: {}", e))
+    ///
+    /// Keeps the session for profile and follow writes. Conversation storage signs in on its
+    /// own, scoped to `/pub/private_messages/`, so sending does not require calling this.
+    pub async fn sign_in(&self) -> Result<SessionInfo> {
+        let session = self.new_session().await?;
+        Ok(self.keep(session).await)
+    }
+
+    /// A session grant, or the deprecated cookie session from a homeserver that has no grant
+    /// endpoint yet, so a client on this release still signs in to an older homeserver
+    async fn new_session(&self) -> Result<PubkySession> {
+        let signer = self.signer();
+        match signer.signin(client_id()).await {
+            Ok(session) => Ok(session),
+            Err(e) if grant_unsupported(&e) => {
+                #[allow(deprecated)]
+                let session = signer.signin_cookie().await;
+                session.map_err(|e| anyhow!("Failed to sign in: {}", e))
+            }
+            Err(e) => Err(anyhow!("Failed to sign in: {}", e)),
+        }
+    }
+
+    async fn keep(&self, session: PubkySession) -> SessionInfo {
+        let info = session.info();
+        *self.session.lock().await = Some(session);
+        info
+    }
+
+    /// The kept session, signing in first if there is none
+    ///
+    /// The lock is held across the sign-in, so concurrent first writes share one session rather
+    /// than each minting a grant.
+    async fn session(&self) -> Result<PubkySession> {
+        let mut kept = self.session.lock().await;
+        if let Some(session) = kept.as_ref() {
+            return Ok(session.clone());
+        }
+        let session = self.new_session().await?;
+        *kept = Some(session.clone());
+        Ok(session)
     }
 
     /// Create an account on a homeserver and publish it as this identity's homeserver
@@ -144,18 +195,26 @@ impl PrivateMessengerClient {
         &self,
         homeserver: &PublicKey,
         signup_token: Option<&str>,
-    ) -> Result<Session> {
-        self.client
-            .signup(&self.keypair, homeserver, signup_token)
+    ) -> Result<SessionInfo> {
+        let homeserver = pubky::PublicKey::from(homeserver);
+        let signer = self.signer();
+        signer
+            .signup(&homeserver, signup_token)
             .await
             .map_err(|e| {
-                // pubky sends the token in the query string, and reqwest errors include the URL
+                // Transport errors can include the request URL, which may carry the token
                 let mut message = e.to_string();
                 if let Some(token) = signup_token.filter(|t| !t.is_empty()) {
                     message = message.replace(token, "[redacted]");
                 }
                 anyhow!("Failed to sign up: {}", message)
-            })
+            })?;
+        // pubky 0.16 separates account creation from the session
+        let session = self
+            .new_session()
+            .await
+            .map_err(|e| anyhow!("Signed up, but {}", e))?;
+        Ok(self.keep(session).await)
     }
 
     /// Sign in, creating an account on `homeserver` if this identity has none yet
@@ -168,17 +227,19 @@ impl PrivateMessengerClient {
         &self,
         homeserver: &PublicKey,
         signup_token: Option<&str>,
-    ) -> Result<Session> {
+    ) -> Result<SessionInfo> {
         let sign_in_error = match self.sign_in().await {
             Ok(session) => return Ok(session),
             Err(e) => e,
         };
 
-        let has_homeserver_record = self
-            .client
-            .get_homeserver(&self.keypair.public_key())
-            .await
-            .is_some();
+        // A failed lookup is not an absent record, so it must not lead to a sign-up either
+        let has_homeserver_record = !matches!(
+            self.pubky()
+                .get_homeserver_of(&self.keypair.public_key().into())
+                .await,
+            Ok(None)
+        );
 
         if has_homeserver_record {
             return Err(sign_in_error);
@@ -323,7 +384,7 @@ impl PrivateMessengerClient {
             "pubky://{}/pub/pubky.app/profile.json",
             self.keypair.public_key()
         );
-        let response = self.client.get(&profile_url).send().await?;
+        let response = self.get(&profile_url).await?;
 
         if response.status().is_success() {
             let profile_data = response.text().await?;
@@ -342,7 +403,7 @@ impl PrivateMessengerClient {
             "pubky://{}/pub/pubky.app/follows/",
             self.keypair.public_key()
         );
-        let response = self.client.get(&follows_url).send().await?;
+        let response = self.get(&follows_url).await?;
 
         if !response.status().is_success() {
             return Ok(Vec::new());
@@ -377,7 +438,7 @@ impl PrivateMessengerClient {
             .ok_or_else(|| anyhow!("Failed to extract pubky from URL"))?;
 
         let profile_url = format!("pubky://{}/pub/pubky.app/profile.json", pubky_id);
-        let response = self.client.get(&profile_url).send().await?;
+        let response = self.get(&profile_url).await?;
 
         if response.status().is_success() {
             let profile_data = response.text().await?;
@@ -402,7 +463,7 @@ impl PrivateMessengerClient {
     /// Get followed users for a specific pubky
     pub async fn get_followed_users_for(&self, pubky: &str) -> Result<Vec<FollowedUser>> {
         let follows_url = format!("pubky://{}/pub/pubky.app/follows/", pubky);
-        let response = self.client.get(&follows_url).send().await?;
+        let response = self.get(&follows_url).await?;
 
         if !response.status().is_success() {
             return Ok(Vec::new());
@@ -441,45 +502,37 @@ impl PrivateMessengerClient {
             "created_at": timestamp
         });
 
-        // Construct the follow URL
-        let follow_url = format!(
-            "pubky://{}/pub/pubky.app/follows/{}",
-            self.keypair.public_key(),
-            target_pubky
-        );
+        let follow_path = format!("/pub/pubky.app/follows/{}", target_pubky);
 
-        // Send PUT request with follow data
-        let response = self
-            .client
-            .put(&follow_url)
-            .body(follow_data.to_string())
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("Failed to create follow: {}", response.status()));
-        }
+        self.session()
+            .await?
+            .storage()
+            .put(follow_path, follow_data.to_string())
+            .await
+            .map_err(|e| anyhow!("Failed to create follow: {}", e))?;
 
         Ok(())
     }
 
     /// Unfollow a user by removing them from our follow list
     pub async fn delete_follow(&self, target_pubky: &str) -> Result<()> {
-        // Construct the follow URL
-        let follow_url = format!(
-            "pubky://{}/pub/pubky.app/follows/{}",
-            self.keypair.public_key(),
-            target_pubky
-        );
+        let follow_path = format!("/pub/pubky.app/follows/{}", target_pubky);
 
-        // Send DELETE request
-        let response = self.client.delete(&follow_url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("Failed to delete follow: {}", response.status()));
-        }
+        self.session()
+            .await?
+            .storage()
+            .delete(follow_path)
+            .await
+            .map_err(|e| anyhow!("Failed to delete follow: {}", e))?;
 
         Ok(())
+    }
+
+    /// Read a public `pubky://` resource, with any HTTP status
+    async fn get(&self, url: &str) -> Result<reqwest::Response> {
+        let url = url.into_pubky_resource()?.to_transport_url()?;
+        let request = self.client.request_async(pubky::Method::GET, url).await?;
+        Ok(request.send().await?)
     }
 
     /// Get the public key of this client
@@ -575,4 +628,19 @@ impl PrivateMessengerClient {
         )
         .await
     }
+}
+
+fn client_id() -> ClientId {
+    ClientId::new(CLIENT_ID).expect("a short, nonempty client ID is valid")
+}
+
+/// Whether a grant sign-in failed because the homeserver has no grant endpoint, as homeservers
+/// before 0.16 do not
+fn grant_unsupported(error: &pubky::Error) -> bool {
+    matches!(
+        error,
+        pubky::Error::Request(pubky::errors::RequestError::Server { status, .. })
+            if *status == reqwest::StatusCode::NOT_FOUND
+                || *status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+    )
 }
