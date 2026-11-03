@@ -60,6 +60,7 @@ pub use receive::{FailureReason, FetchConfig, FetchFailure, MessageFetch};
 pub use bip39::Language;
 pub use pkarr::{Keypair, PublicKey};
 
-/// The pubky crate this library is built against, for configuring a client to pass to
-/// [`PrivateMessengerClient::with_client`] without a version mismatch.
+/// The pubky crate this library is built against, for configuring a
+/// [`pubky::PubkyHttpClient`] to pass to [`PrivateMessengerClient::with_client`] without a
+/// version mismatch.
 pub use pubky;

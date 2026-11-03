@@ -1,3 +1,5 @@
+mod common;
+
 use anyhow::Result;
 use pubky_messenger::{
     ChangePolicy, FetchConfig, Keypair, PrivateMessage, PrivateMessengerClient, PublicKey,
@@ -39,8 +41,8 @@ fn acknowledge_all(state: &mut ReceiveState, received: &ReceivedMessages) {
 
 #[tokio::test]
 async fn test_only_unacknowledged_messages_are_received() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?.public_key();
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let alice = signed_up_client(&testnet, &homeserver).await?;
     let bob = signed_up_client(&testnet, &homeserver).await?;
     let mut state = ReceiveState::default();
@@ -112,8 +114,8 @@ async fn test_only_unacknowledged_messages_are_received() -> Result<()> {
 
 #[tokio::test]
 async fn test_revalidate_redelivers_a_message_rewritten_in_place() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?.public_key();
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let alice = signed_up_client(&testnet, &homeserver).await?;
     let bob = signed_up_client(&testnet, &homeserver).await?;
     alice.send_message(&bob.public_key(), "first draft").await?;
@@ -139,13 +141,18 @@ async fn test_revalidate_redelivers_a_message_rewritten_in_place() -> Result<()>
     assert!(not_modified.messages.is_empty() && not_modified.failures.is_empty());
 
     let edited = PrivateMessage::new(alice.keypair(), &bob.public_key(), "second draft")?;
-    let raw = testnet.client_builder().build()?;
-    raw.signin(alice.keypair()).await?;
-    raw.put(&url)
-        .body(serde_json::to_string(&edited)?)
-        .send()
-        .await?
-        .error_for_status()?;
+    let path = url
+        .strip_prefix(&format!("pubky://{}", alice.public_key()))
+        .expect("a message URL in alice's storage");
+    let session = testnet
+        .sdk()?
+        .signer(alice.keypair().clone().into())
+        .signin(pubky_testnet::pubky::ClientId::new("test")?)
+        .await?;
+    session
+        .storage()
+        .put(path, serde_json::to_string(&edited)?)
+        .await?;
 
     let concealed = bob
         .receive_new_messages(&alice.public_key(), &mut write_once)

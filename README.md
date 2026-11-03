@@ -16,7 +16,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pubky-messenger = "0.4.0"
+pubky-messenger = "0.5.0"
 ```
 
 ## Usage
@@ -206,7 +206,7 @@ To use a testnet, custom pkarr relays, or other client settings, build the pubky
 ```rust
 use pubky_messenger::{pubky, Keypair, PrivateMessengerClient};
 
-let pubky_client = pubky::Client::builder().testnet().build()?;
+let pubky_client = pubky::PubkyHttpClient::builder().testnet().build()?;
 let client = PrivateMessengerClient::with_client(Keypair::random(), pubky_client);
 ```
 
@@ -356,12 +356,12 @@ The main client for interacting with the Pubky messaging system.
 #### Methods
 
 - `new(keypair: Keypair) -> Result<Self>` - Create a new client from a keypair
-- `with_client(keypair: Keypair, client: pubky::Client) -> Self` - Create a client using an already configured pubky client
+- `with_client(keypair: Keypair, client: pubky::PubkyHttpClient) -> Self` - Create a client using an already configured pubky client
 - `from_recovery_file(bytes: &[u8], passphrase: Option<&str>) -> Result<Self>` - Create from recovery file with optional passphrase
 - `from_recovery_phrase(mnemonic: &str, passphrase: Option<&str>, language: Option<Language>) -> Result<Self>` - Create from 12-word BIP39 mnemonic with optional passphrase and language
-- `sign_in(&self) -> Result<Session>` - Sign in to the homeserver
-- `sign_up(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<Session>` - Create an account on a homeserver
-- `ensure_session(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<Session>` - Sign in, signing up first if the identity has no homeserver yet
+- `sign_in(&self) -> Result<SessionInfo>` - Sign in to the homeserver with a session grant, or with the cookie flow on a homeserver older than 0.16
+- `sign_up(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<SessionInfo>` - Create an account on a homeserver, then sign in
+- `ensure_session(&self, homeserver: &PublicKey, signup_token: Option<&str>) -> Result<SessionInfo>` - Sign in, signing up first if the identity has no homeserver yet
 - `send_message(&self, recipient: &PublicKey, content: &str) -> Result<String>` - Send encrypted message
 - `prepare_message(&self, recipient: &PublicKey, content: &str) -> Result<PreparedMessage>` - Prepare a stable encrypted publication before I/O
 - `publish_message(&self, prepared: &PreparedMessage) -> Result<String>` - Publish or retry the prepared ID and exact payload

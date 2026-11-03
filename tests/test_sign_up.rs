@@ -1,7 +1,27 @@
+mod common;
+
 use anyhow::Result;
-use pkarr::dns::rdata::RData;
 use pubky_messenger::{Keypair, PrivateMessengerClient, PublicKey};
+use pubky_testnet::docker_postgres::DockerPostgres;
+use pubky_testnet::pubky_homeserver::{
+    storage_config::StorageConfigToml, ConfigToml, HomeserverApp, MockDataDir, SignupMode,
+};
 use pubky_testnet::Testnet;
+
+/// A homeserver this test owns, so dropping it shuts it down
+async fn owned_homeserver(testnet: &Testnet, signup_mode: SignupMode) -> Result<HomeserverApp> {
+    let mut config = ConfigToml::default_test_config();
+    config.general.signup_mode = signup_mode;
+    config.general.database_url = Some(DockerPostgres::shared().await.connection_string()?);
+    config.pkdns.dht_bootstrap_nodes = Some(testnet.dht_bootstrap_nodes());
+    config.storage.backend = StorageConfigToml::InMemory;
+    let data_dir = MockDataDir::new(config, Some(pubky_testnet::pubky::Keypair::random()))?;
+    HomeserverApp::start_with_mock_data_dir(data_dir).await
+}
+
+fn key(homeserver: &HomeserverApp) -> PublicKey {
+    homeserver.public_key().into_inner()
+}
 
 fn testnet_client(testnet: &Testnet, keypair: Keypair) -> Result<PrivateMessengerClient> {
     let client = testnet.client_builder().build()?;
@@ -9,18 +29,13 @@ fn testnet_client(testnet: &Testnet, keypair: Keypair) -> Result<PrivateMessenge
 }
 
 async fn resolved_homeserver(testnet: &Testnet, public_key: &PublicKey) -> Option<String> {
-    let packet = testnet
-        .client_builder()
-        .build()
+    let homeserver = testnet
+        .sdk()
         .ok()?
-        .pkarr()
-        .resolve_most_recent(public_key)
-        .await;
-    packet?.resource_records("_pubky").find_map(|rr| match &rr.rdata {
-        RData::SVCB(svcb) => Some(svcb.target.to_string()),
-        RData::HTTPS(https) => Some(https.0.target.to_string()),
-        _ => None,
-    })
+        .get_homeserver_of(&public_key.into())
+        .await
+        .ok()??;
+    Some(homeserver.z32())
 }
 
 #[test]
@@ -35,15 +50,15 @@ fn test_keypair_accessor_returns_client_keypair() -> Result<()> {
 
 #[tokio::test]
 async fn test_sign_up_makes_new_identity_usable() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?;
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let keypair = Keypair::random();
     let client = testnet_client(&testnet, keypair.clone())?;
 
     assert!(client.sign_in().await.is_err());
 
-    let session = client.sign_up(&homeserver.public_key(), None).await?;
-    assert_eq!(session.pubky(), &keypair.public_key());
+    let session = client.sign_up(&homeserver, None).await?;
+    assert_eq!(session.public_key().z32(), keypair.public_key().to_z32());
 
     let fresh_client = testnet_client(&testnet, keypair)?;
     fresh_client.sign_in().await?;
@@ -55,78 +70,69 @@ async fn test_sign_up_makes_new_identity_usable() -> Result<()> {
 
 #[tokio::test]
 async fn test_ensure_session_signs_in_to_existing_account() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let first_homeserver = testnet.run_homeserver().await?;
-    let second_homeserver = testnet.run_homeserver().await?;
+    let mut testnet = common::testnet().await?;
+    let first_homeserver = common::homeserver(&mut testnet).await?;
+    let second_homeserver = common::homeserver(&mut testnet).await?;
     let keypair = Keypair::random();
 
     let client = testnet_client(&testnet, keypair.clone())?;
-    client
-        .ensure_session(&first_homeserver.public_key(), None)
-        .await?;
+    client.ensure_session(&first_homeserver, None).await?;
 
     let restarted = testnet_client(&testnet, keypair)?;
-    restarted
-        .ensure_session(&second_homeserver.public_key(), None)
-        .await?;
+    restarted.ensure_session(&second_homeserver, None).await?;
 
     let recipient = Keypair::random().public_key();
     restarted.send_message(&recipient, "hello").await?;
 
     let host = resolved_homeserver(&testnet, &restarted.public_key()).await;
-    assert_eq!(host, Some(first_homeserver.public_key().to_string()));
+    assert_eq!(host, Some(first_homeserver.to_string()));
 
     Ok(())
 }
 
 #[tokio::test]
 async fn test_ensure_session_does_not_sign_up_elsewhere_when_homeserver_is_down() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let first_homeserver = testnet.run_homeserver().await?;
-    let second_homeserver = testnet.run_homeserver().await?;
+    let mut testnet = common::testnet().await?;
+    let first = owned_homeserver(&testnet, SignupMode::Open).await?;
+    let first_homeserver = key(&first);
+    let second_homeserver = common::homeserver(&mut testnet).await?;
     let keypair = Keypair::random();
 
     let client = testnet_client(&testnet, keypair.clone())?;
-    client
-        .ensure_session(&first_homeserver.public_key(), None)
-        .await?;
+    client.ensure_session(&first_homeserver, None).await?;
 
-    first_homeserver.shutdown().await;
+    drop(first);
 
     let restarted = testnet_client(&testnet, keypair)?;
-    let result = restarted
-        .ensure_session(&second_homeserver.public_key(), None)
-        .await;
+    let result = restarted.ensure_session(&second_homeserver, None).await;
     assert!(result.is_err());
 
     let host = resolved_homeserver(&testnet, &restarted.public_key()).await;
-    assert_eq!(host, Some(first_homeserver.public_key().to_string()));
+    assert_eq!(host, Some(first_homeserver.to_string()));
 
     Ok(())
 }
 
 #[tokio::test]
 async fn test_ensure_session_passes_signup_token() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver_with_signup_tokens().await?;
+    let testnet = common::testnet().await?;
+    let server = owned_homeserver(&testnet, SignupMode::TokenRequired).await?;
+    let homeserver = key(&server);
     let client = testnet_client(&testnet, Keypair::random())?;
 
-    assert!(client
-        .ensure_session(&homeserver.public_key(), None)
-        .await
-        .is_err());
+    assert!(client.ensure_session(&homeserver, None).await.is_err());
 
     let error = client
-        .sign_up(&homeserver.public_key(), Some("AAAA-BBBB-CCCC"))
+        .sign_up(&homeserver, Some("AAAA-BBBB-CCCC"))
         .await
         .unwrap_err();
     assert!(!error.to_string().contains("AAAA-BBBB-CCCC"), "{error}");
 
-    let admin = testnet.client_builder().build()?;
-    let token = admin
+    let admin = server.admin_server().expect("test config enables admin");
+    let token = reqwest::Client::new()
         .get(format!(
-            "https://{}/admin/generate_signup_token",
-            homeserver.public_key()
+            "http://{}/generate_signup_token",
+            admin.listen_socket()
         ))
         .header("X-Admin-Password", "admin")
         .send()
@@ -135,9 +141,7 @@ async fn test_ensure_session_passes_signup_token() -> Result<()> {
         .text()
         .await?;
 
-    client
-        .ensure_session(&homeserver.public_key(), Some(&token))
-        .await?;
+    client.ensure_session(&homeserver, Some(&token)).await?;
 
     Ok(())
 }

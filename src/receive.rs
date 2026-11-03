@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures::future::{join_all, BoxFuture};
 use pkarr::{Keypair, PublicKey};
 use pubky_common::auth::AuthToken;
-use pubky_common::capabilities::{Action, Capability};
+use pubky_common::capabilities::Capability;
 use std::fmt;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -177,10 +177,10 @@ pub(crate) trait Transport: Sync {
     fn delete<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<HttpResponse, String>>;
 }
 
-/// Reads and deletes `pubky://` URLs the way `pubky::Client` does, but only follows redirects
-/// that stay on the origin first requested
+/// Reads and deletes `pubky://` URLs the way `pubky::PubkyHttpClient` does for legacy storage
+/// addressing, but only follows redirects that stay on the origin first requested
 ///
-/// `pubky::Client` follows any redirect, so a homeserver could send a request to a loopback or
+/// The pubky client follows any redirect, so a homeserver could send a request to a loopback or
 /// internal address, and its HTTP client cannot be reconfigured.
 pub(crate) struct PubkyTransport {
     http: reqwest::Client,
@@ -198,7 +198,7 @@ enum Mutation<'a> {
 }
 
 impl PubkyTransport {
-    pub(crate) fn new(client: &pubky::Client, keypair: Keypair) -> Self {
+    pub(crate) fn new(client: &pubky::PubkyHttpClient, keypair: Keypair) -> Self {
         let http = reqwest::ClientBuilder::from(client.pkarr().clone())
             .redirect(same_origin_redirects())
             .cookie_store(true)
@@ -206,7 +206,7 @@ impl PubkyTransport {
             .expect("config expected to not error");
         Self {
             http,
-            session_url: format!("https://_pubky.{}/session", keypair.public_key()),
+            session_url: format!("https://_pubky.{}/session", keypair.public_key().to_z32()),
             keypair,
             session: Mutex::new(0),
             metrics: RequestMetrics::default(),
@@ -214,11 +214,11 @@ impl PubkyTransport {
     }
 
     async fn sign_in(&self) -> Result<HttpResponse, String> {
-        let capability = Capability {
-            scope: "/pub/private_messages/".to_string(),
-            actions: vec![Action::Write],
-        };
-        let token = AuthToken::sign(&self.keypair, vec![capability]).serialize();
+        let capability =
+            Capability::write("/pub/private_messages/").map_err(|e| format!("capability: {e}"))?;
+        // The homeserver's cookie `/session` exchange; pubky 0.16 keeps it as its legacy flow
+        let signer = pubky::Keypair::from(self.keypair.clone());
+        let token = AuthToken::sign(&signer, vec![capability]).serialize();
         self.metrics.sent(RequestKind::Session, token.len());
         let response = self
             .http
@@ -279,6 +279,7 @@ impl PubkyTransport {
             ),
             Mutation::Delete => (self.http.delete(url), RequestKind::Delete, 0),
         };
+        let request = with_pubky_host(request, url);
         self.metrics.sent(kind, bytes);
         let response = request.send().await.map_err(|e| error_chain(&e))?;
         self.response(response, kind).await
@@ -327,6 +328,21 @@ fn https_url(url: &str) -> Result<String, String> {
     }
 }
 
+/// Name the storage owner the way pubky 0.16 does for legacy storage addressing
+///
+/// Homeservers from 0.16 on take the tenant from a bare-key `host` or from `pubky-host`, so a
+/// `_pubky.<key>` host alone no longer selects it. Earlier homeservers ignore the header.
+fn with_pubky_host(request: reqwest::RequestBuilder, url: &str) -> reqwest::RequestBuilder {
+    let owner = url
+        .strip_prefix("https://_pubky.")
+        .and_then(|rest| rest.split(['/', '?']).next())
+        .filter(|owner| PublicKey::try_from(*owner).is_ok());
+    match owner {
+        Some(owner) => request.header("pubky-host", owner),
+        None => request,
+    }
+}
+
 pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         // The first previous URL is the one originally requested
@@ -349,7 +365,8 @@ impl Transport for PubkyTransport {
         if_none_match: Option<&'a str>,
     ) -> BoxFuture<'a, Result<HttpResponse, String>> {
         Box::pin(async move {
-            let mut request = self.http.get(https_url(url)?);
+            let https = https_url(url)?;
+            let mut request = with_pubky_host(self.http.get(&https), &https);
             if let Some(etag) = if_none_match {
                 request = request.header("if-none-match", etag);
             }

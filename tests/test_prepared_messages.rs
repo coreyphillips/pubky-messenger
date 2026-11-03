@@ -1,3 +1,5 @@
+mod common;
+
 use anyhow::Result;
 use pubky_messenger::{Keypair, PreparedMessage, PrivateMessengerClient, PublicKey};
 use pubky_testnet::Testnet;
@@ -11,8 +13,8 @@ async fn signed_up(testnet: &Testnet, homeserver: &PublicKey) -> Result<PrivateM
 
 #[tokio::test]
 async fn prepared_publication_survives_restart_and_decrypts_once() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?.public_key();
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let alice = signed_up(&testnet, &homeserver).await?;
     let bob = signed_up(&testnet, &homeserver).await?;
     let prepared = alice.prepare_message(&bob.public_key(), "saved before publication")?;
@@ -54,8 +56,8 @@ async fn prepared_publication_survives_restart_and_decrypts_once() -> Result<()>
 
 #[tokio::test]
 async fn concurrent_publication_shares_session_and_stores_one_message() -> Result<()> {
-    let testnet = Testnet::run().await?;
-    let homeserver = testnet.run_homeserver().await?.public_key();
+    let mut testnet = common::testnet().await?;
+    let homeserver = common::homeserver(&mut testnet).await?;
     let alice = signed_up(&testnet, &homeserver).await?;
     let bob = signed_up(&testnet, &homeserver).await?;
     let prepared = alice.prepare_message(&bob.public_key(), "concurrent replay")?;

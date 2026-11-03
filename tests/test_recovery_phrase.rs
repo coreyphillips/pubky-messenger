@@ -58,7 +58,11 @@ fn test_from_recovery_phrase_invalid() {
 
     for invalid_mnemonic in invalid_cases {
         let result = PrivateMessengerClient::from_recovery_phrase(invalid_mnemonic, None, None);
-        assert!(result.is_err(), "Should fail for invalid mnemonic: '{}'", invalid_mnemonic);
+        assert!(
+            result.is_err(),
+            "Should fail for invalid mnemonic: '{}'",
+            invalid_mnemonic
+        );
     }
 }
 
@@ -115,16 +119,12 @@ fn test_from_recovery_phrase_with_extra_spaces() -> Result<()> {
 
     // If it succeeds, it should produce the same keypair (normalized)
     // If it fails, that's also acceptable behavior
-    match result_extra {
-        Ok(client_extra) => {
-            // If both work, they should produce the same keypair due to normalization
-            assert_eq!(client_normal.public_key_string(), client_extra.public_key_string(),
-                "Normalized mnemonics should produce the same keypair");
-        }
-        Err(_) => {
-            // Failing on extra spaces is also valid behavior
-            assert!(true, "Extra spaces causing failure is acceptable");
-        }
+    if let Ok(client_extra) = result_extra {
+        assert_eq!(
+            client_normal.public_key_string(),
+            client_extra.public_key_string(),
+            "Normalized mnemonics should produce the same keypair"
+        );
     }
 
     // Normal spacing should always work
@@ -141,11 +141,8 @@ fn test_from_recovery_phrase_with_extra_spaces() -> Result<()> {
 fn test_from_recovery_phrase_with_language() -> Result<()> {
     // Test with English explicitly
     let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    let client_english = PrivateMessengerClient::from_recovery_phrase(
-        mnemonic,
-        None,
-        Some(Language::English),
-    )?;
+    let client_english =
+        PrivateMessengerClient::from_recovery_phrase(mnemonic, None, Some(Language::English))?;
 
     // Test that default (no language param) produces the same result as explicit English
     let client_default = PrivateMessengerClient::from_recovery_phrase(mnemonic, None, None)?;
@@ -171,11 +168,8 @@ fn test_from_recovery_phrase_with_passphrase() -> Result<()> {
     let client_no_pass = PrivateMessengerClient::from_recovery_phrase(mnemonic, None, None)?;
 
     // With passphrase
-    let client_with_pass = PrivateMessengerClient::from_recovery_phrase(
-        mnemonic,
-        Some("my_secure_passphrase"),
-        None,
-    )?;
+    let client_with_pass =
+        PrivateMessengerClient::from_recovery_phrase(mnemonic, Some("my_secure_passphrase"), None)?;
 
     // Different passphrases should produce different keypairs
     assert_ne!(
@@ -185,11 +179,8 @@ fn test_from_recovery_phrase_with_passphrase() -> Result<()> {
     );
 
     // Same passphrase should produce same keypair
-    let client_with_pass2 = PrivateMessengerClient::from_recovery_phrase(
-        mnemonic,
-        Some("my_secure_passphrase"),
-        None,
-    )?;
+    let client_with_pass2 =
+        PrivateMessengerClient::from_recovery_phrase(mnemonic, Some("my_secure_passphrase"), None)?;
 
     assert_eq!(
         client_with_pass.public_key_string(),
@@ -206,16 +197,10 @@ fn test_from_recovery_phrase_language_consistency() -> Result<()> {
     let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     // Multiple calls with same language should produce same keypair
-    let client1 = PrivateMessengerClient::from_recovery_phrase(
-        mnemonic,
-        None,
-        Some(Language::English),
-    )?;
-    let client2 = PrivateMessengerClient::from_recovery_phrase(
-        mnemonic,
-        None,
-        Some(Language::English),
-    )?;
+    let client1 =
+        PrivateMessengerClient::from_recovery_phrase(mnemonic, None, Some(Language::English))?;
+    let client2 =
+        PrivateMessengerClient::from_recovery_phrase(mnemonic, None, Some(Language::English))?;
 
     assert_eq!(
         client1.public_key_string(),

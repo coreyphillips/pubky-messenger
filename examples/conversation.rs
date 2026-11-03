@@ -50,7 +50,9 @@ async fn main() -> Result<()> {
 
     // Fetch initial messages, and remember them so polling downloads only new ones
     let mut receive_state = ReceiveState::default();
-    let initial = client.receive_new_messages(&peer, &mut receive_state).await?;
+    let initial = client
+        .receive_new_messages(&peer, &mut receive_state)
+        .await?;
     let mut messages = Vec::new();
     for item in &initial.messages {
         messages.extend(item.message.clone());
@@ -75,10 +77,8 @@ async fn main() -> Result<()> {
         let stdin = io::stdin();
         loop {
             let mut input = String::new();
-            if stdin.read_line(&mut input).is_ok() {
-                if tx_clone.send(input).await.is_err() {
-                    break;
-                }
+            if stdin.read_line(&mut input).is_ok() && tx_clone.send(input).await.is_err() {
+                break;
             }
         }
     });
