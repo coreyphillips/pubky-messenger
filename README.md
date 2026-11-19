@@ -487,6 +487,14 @@ This example provides a real-time chat experience:
 - Automatic new message detection
 - Clean, chat-like interface
 
+## Protocol v2
+
+[`PROTOCOL-v2.md`](PROTOCOL-v2.md) specifies a second message protocol for apps that sign in with
+Pubky grants and never hold the identity secret. It derives a messaging keypair from a scoped grant
+key and publishes its public half. It is implemented in
+[pubky-messenger-ts](https://github.com/coreyphillips/pubky-messenger-ts) 0.6.0; support in this
+crate is planned.
+
 ## Testing
 
 ### Running Tests
